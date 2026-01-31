@@ -10,8 +10,14 @@ from flask import (
     g,
     current_app,
 )
-from datetime import datetime, timezone, timedelta
-import jwt
+from flask_jwt_extended import (
+    create_access_token,
+    create_refresh_token,
+    set_refresh_cookies,
+    jwt_required,
+    get_jwt_identity,
+    unset_jwt_cookies
+)
 import uuid
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -34,12 +40,11 @@ def login():
         if not user or not check_password_hash(user["password_hash"], password):
             return jsonify({'message': 'Invalid email or password'}), 401
 
-        token = jwt.encode({'public_id': user["public_id"], 'exp': datetime.now(timezone.utc) + timedelta(hours=1)},
-                           current_app.config['SECRET_KEY'], algorithm="HS256")
-
-        response = make_response(redirect("https://google.com"))
-        response.set_cookie('jwt_token', token)
-
+        access_token = create_access_token(identity=email_id)
+        refresh_token = create_refresh_token(identity=email_id)
+        response = jsonify({"access_token": access_token})
+        set_refresh_cookies(response, refresh_token)
+        
         return response
     else:
         return render_template('login.html')
@@ -61,3 +66,18 @@ def register():
         return redirect(url_for('auth.login'))
 
     return render_template('register.html')
+
+
+@auth_bp.post("/refresh")
+@jwt_required(refresh=True)
+def refresh():
+    email_id = get_jwt_identity()
+    new_access = create_access_token(identity=email_id)
+    return {"access_token": new_access}
+
+
+@auth_bp.post("/logout")
+def logout():
+    response = jsonify({"msg": "logged out"})
+    unset_jwt_cookies(response)
+    return response
