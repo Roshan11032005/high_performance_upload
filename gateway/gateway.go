@@ -25,8 +25,8 @@ const (
 	GATEWAY_HTTP_PORT   = ":5000"      // Gateway listens here
 	GATEWAY_BINARY_PORT = ":9090"      // Gateway binary protocol port
 	FLASK_BACKEND       = "http://flask_webserver:5001"  // Flask backend
-	GNET_HTTP_BACKEND   = "http://gateway:8085"  // gnet HTTP APIs
-	GNET_BINARY_BACKEND = "gateway:8081"         // gnet binary protocol
+	GNET_HTTP_BACKEND   = "http://file_server:8081"  // gnet HTTP APIs
+	GNET_BINARY_BACKEND = "file_server:8081"         // gnet binary protocol
 
 	// Binary protocol commands (must match gnet server)
 	CMD_UPLOAD_CHUNK = 0x01
