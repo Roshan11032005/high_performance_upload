@@ -16,18 +16,24 @@ def check_if_user_name_is_unique(user_name: str) -> bool:
             return False
 
 
-def register_user(user_name: str, password_hash: str):
-    mail_id = user_name
-    query = 'INSERT INTO "user" (user_name, password_hash, mail_id) VALUES (:user_name, :password_hash, :mail_id)'
+def register_user(email_id: str, password_hash: str, public_id: str):
+    query = "INSERT INTO users (email_id, password_hash, public_id) VALUES (:email_id, :password_hash, :public_id)"
     with db.engine.begin() as conn:
         conn.execute(
             text(query),
-            {"user_name": user_name, "password_hash": password_hash, "mail_id": mail_id},
+            {"email_id": email_id, "password_hash": password_hash, "public_id": public_id},
         )
 
 
 def get_user(email_id: str):
-    query = 'SELECT * FROM users WHERE OR email_id=:email_id'
+    query = "SELECT * FROM users WHERE email_id=:email_id"
     with db.engine.connect() as conn:
-        res = conn.execute(text(query), {"email_id": email_id, "user_id": user_id})
+        res = conn.execute(text(query), {"email_id": email_id})
+        return res.mappings().fetchone()
+
+
+def get_user_by_public_id(public_id: str):
+    query = "SELECT * FROM users WHERE public_id = :public_id"
+    with db.engine.connect() as conn:
+        res = conn.execute(text(query), {"public_id": public_id})
         return res.mappings().fetchone()

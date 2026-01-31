@@ -10,7 +10,7 @@ FROM golang:1.23.8-alpine AS builder
 RUN apk add --no-cache git gcc musl-dev
 
 # Set working directory
-WORKDIR /app/gateway
+WORKDIR /build
 
 # Copy go mod files
 COPY go.mod go.sum ./

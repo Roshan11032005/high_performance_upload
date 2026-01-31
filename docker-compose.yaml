@@ -34,9 +34,7 @@ services:
   
   gateway:
     build:
-      context: ./gateway/.build
-    volumes:
-      - ./gateway:/app/gateway
+      context: ./gateway/
     ports:
       - "5000:5000"
     
