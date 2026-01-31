@@ -12,5 +12,6 @@ CREATE TABLE s3_metadata(
     id SERIAL PRIMARY KEY,
     email_id VARCHAR(100) REFERENCES users(email_id),
     file_path VARCHAR,
-    file_size INT
+    file_size INT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
