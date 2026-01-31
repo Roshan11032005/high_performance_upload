@@ -1,0 +1,46 @@
+version: "3.8"
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: strongpassword
+    volumes:
+      - minio_data:/data
+
+  flask_webserver:
+    build:
+      context: ./flask_webserver/.
+    command: python3 manage.py runserver --debug
+    volumes:
+      - ./flask_webserver:/app/flask_webserver
+    depends_on:
+      - pg_db
+    ports:
+      - "5001:5001"
+
+  pg_db:
+    image: postgres:17
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+  
+  gateway:
+    build:
+      context: ./gateway/.build
+    volumes:
+      - ./gateway:/app/gateway
+    ports:
+      - "5000:5000"
+    
+
+volumes:
+  minio_data:
+  pg_data:
