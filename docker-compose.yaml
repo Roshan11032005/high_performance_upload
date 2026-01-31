@@ -1,7 +1,10 @@
 version: "3.8"
+
 services:
+  # MinIO - S3-compatible object storage
   minio:
-    image: minio/minio
+    image: minio/minio:latest
+    container_name: minio
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -11,6 +14,36 @@ services:
       MINIO_ROOT_PASSWORD: strongpassword
     volumes:
       - minio_data:/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # PostgreSQL Database
+  pg_db:
+    image: postgres:17-alpine
+    container_name: postgres_db
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Flask Web Server
 
   flask_webserver:
     build:
@@ -23,27 +56,54 @@ services:
     ports:
       - "5001:5001"
 
-  pg_db:
-    image: postgres:17
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_PASSWORD: postgres
+  # gnet File Upload Server
+  file_server:
+    build:
+      context: ./gnet-backend
+      dockerfile: Dockerfile
+    container_name: gnet_file_server
     ports:
-      - "5432:5432"
+      - "8081:8081" # Binary protocol
+      - "8085:8085" # HTTP API (future use)
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=admin
+      - S3_SECRET_KEY=strongpassword
+      - S3_BUCKET=uploads
+      - S3_REGION=us-east-1
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
 
+  # Gateway (Smart Router)
   gateway:
     build:
-      context: ./gateway/
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: gateway
     ports:
-      - "5000:5000"
-
-  frontend:
-    build:
-      context: ./frontend/
-    ports:
-      - "8081:8081"
+      - "5000:5000" # HTTP gateway
+      - "9090:9090" # Binary gateway
+    environment:
+      - FLASK_BACKEND=http://flask_webserver:5001
+      - GNET_HTTP_BACKEND=http://file_server:8085
+      - GNET_BINARY_BACKEND=file_server:8081
+    depends_on:
+      - flask_webserver
+      - file_server
+    networks:
+      - app-network
+    restart: unless-stopped
 
 volumes:
   minio_data:
+    driver: local
   pg_data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge

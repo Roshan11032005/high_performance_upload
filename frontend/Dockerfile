@@ -18,6 +18,6 @@ COPY package.json package-lock.json ./
 # Copy source
 COPY . .
 
-EXPOSE 8081
+EXPOSE 8090
 
-CMD ["npm", "start"]
+CMD ["npx", "react-native","start","--port","8090"]
