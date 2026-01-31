@@ -16,8 +16,8 @@ def check_if_user_name_is_unique(user_name: str) -> bool:
             return False
 
 
-def register_user(email_id: str, password_hash: str, public_id: str):
-    query = "INSERT INTO users (email_id, password_hash, public_id) VALUES (:email_id, :password_hash, :public_id)"
+def register_user(user_name: str, email_id: str, password_hash: str, public_id: str):
+    query = "INSERT INTO users (user_name, email_id, password_hash, public_id) VALUES (:user_name, :email_id, :password_hash, :public_id)"
     with db.engine.begin() as conn:
         conn.execute(
             text(query),
