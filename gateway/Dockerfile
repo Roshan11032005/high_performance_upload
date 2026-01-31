@@ -4,7 +4,7 @@
 # ============================================
 # Stage 1: Build
 # ============================================
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23.8-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git gcc musl-dev
@@ -40,7 +40,7 @@ RUN addgroup -g 1001 gateway && \
     adduser -D -u 1001 -G gateway gateway
 
 # Set working directory
-WORKDIR /app
+WORKDIR /app/backend
 
 # Copy binary from builder
 COPY --from=builder /build/gateway .
