@@ -1,6 +1,6 @@
 from flask import Flask
 from logging.config import dictConfig
-
+from flask_jwt_extended import JWTManager
 
 def create_app():
     from dotenv import load_dotenv
@@ -36,5 +36,7 @@ def create_app():
     from webserver.views import auth
     app.register_blueprint(auth.auth_bp)
     app.add_url_rule("/", endpoint="index")
+
+    jwt = JWTManager(app)
 
     return app
