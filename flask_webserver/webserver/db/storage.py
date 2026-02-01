@@ -14,3 +14,6 @@ def get_metadata_for_user(email_id: str) -> list[dict]:
     with db.engine.connect() as conn:
         res = conn.execute(text(query), {"email_id": email_id})
         return res.mappings().fetchall()
+    query = "INSERT INTO TABLE s3_metadata (email_id, file_path, file_size) VALUES (:email_id, :file_path, :file_size)"
+    with db.engine.begin() as conn:
+        conn.execute(text(query), {"email_id": email_id, "file_path": file_path, "file_size": size})
