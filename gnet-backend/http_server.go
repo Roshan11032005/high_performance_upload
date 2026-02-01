@@ -1,17 +1,17 @@
-// simple_upload_server.go - Simplified file upload server with JWT token reading
+// simple_upload_server.go - Fixed Idempotency & Preview Headers
 package main
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -34,11 +34,8 @@ import (
 const (
 	HTTP_PORT = ":8085"
 
-	S3_ENDPOINT   = "http://minio:9000"
-	S3_REGION     = "us-east-1"
-	S3_ACCESS_KEY = "admin"
-	S3_SECRET_KEY = "strongpassword"
-	S3_BUCKET     = "uploads"
+	S3_REGION = "us-east-1"
+	S3_BUCKET = "uploads"
 
 	// File constraints
 	MAX_FILE_SIZE  = 10 * 1024 * 1024 * 1024 // 10 GB
@@ -48,6 +45,20 @@ const (
 	// Timeouts
 	SESSION_TIMEOUT = 2 * time.Hour
 	TOKEN_LIFETIME  = 5 * time.Minute
+)
+
+// Get S3 configuration from environment variables with defaults
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+var (
+	S3_ENDPOINT   = getEnv("S3_ENDPOINT", "http://localhost:9000")
+	S3_ACCESS_KEY = getEnv("S3_ACCESS_KEY", "admin")
+	S3_SECRET_KEY = getEnv("S3_SECRET_KEY", "strongpassword")
 )
 
 // Supported file types
@@ -68,47 +79,18 @@ var SUPPORTED_EXTENSIONS = map[string]string{
 }
 
 // ============================================
-// JWT Token (No Signature Verification)
+// Helper Functions
 // ============================================
 
-type JWTClaims struct {
-	Sub      string `json:"sub"`       // email_id
-	PublicID string `json:"public_id"` // user's public_id (we'll use this as user_id)
-	Role     string `json:"role"`      // user role
-	Exp      int64  `json:"exp"`       // expiration
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
 }
 
-func decodeJWTWithoutVerification(tokenString string) (*JWTClaims, error) {
-	// JWT format: header.payload.signature
-	parts := strings.Split(tokenString, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid token format")
-	}
-
-	// Decode payload (second part)
-	payload := parts[1]
-
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-
-	// Base64 decode
-	decoded, err := base64.RawURLEncoding.DecodeString(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode payload: %w", err)
-	}
-
-	// Parse JSON
-	var claims JWTClaims
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return nil, fmt.Errorf("failed to parse claims: %w", err)
-	}
-
-	return &claims, nil
+func respondError(w http.ResponseWriter, status int, message string) {
+	log.Printf("❌ Error: %s", message)
+	respondJSON(w, status, map[string]string{"error": message})
 }
 
 // ============================================
@@ -176,7 +158,7 @@ func NewS3Client() (*S3Client, error) {
 
 type StreamingToken struct {
 	Token     string
-	UserID    string
+	EmailID   string
 	S3Key     string
 	ExpiresAt time.Time
 }
@@ -194,22 +176,22 @@ func NewTokenManager() *TokenManager {
 	return tm
 }
 
-func (tm *TokenManager) CreateStreamingToken(userID, s3Key string) string {
+func (tm *TokenManager) CreateStreamingToken(emailID, s3Key string) string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	tokenData := fmt.Sprintf("%s:%s:%d", userID, s3Key, time.Now().UnixNano())
+	tokenData := fmt.Sprintf("%s:%s:%d", emailID, s3Key, time.Now().UnixNano())
 	hash := sha256.Sum256([]byte(tokenData))
 	token := hex.EncodeToString(hash[:])
 
 	tm.tokens[token] = &StreamingToken{
 		Token:     token,
-		UserID:    userID,
+		EmailID:   emailID,
 		S3Key:     s3Key,
 		ExpiresAt: time.Now().Add(TOKEN_LIFETIME),
 	}
 
-	log.Printf("🎫 Created streaming token for user %s (expires in %v)", userID, TOKEN_LIFETIME)
+	log.Printf("🎫 Created streaming token for user %s (expires in %v)", emailID, TOKEN_LIFETIME)
 	return token
 }
 
@@ -261,8 +243,7 @@ type ChunkInfo struct {
 
 type UploadSession struct {
 	SessionID      string
-	UserID         string
-	Email          string
+	EmailID        string
 	FileName       string
 	S3Key          string
 	FileExtension  string
@@ -340,7 +321,7 @@ func NewSessionManager(s3Client *S3Client) *SessionManager {
 	return sm
 }
 
-func (sm *SessionManager) CreateSession(userID, email, fileName string, totalChunks, chunkSize uint32, totalSize uint64) (*UploadSession, error) {
+func (sm *SessionManager) CreateSession(emailID, fileName string, totalChunks, chunkSize uint32, totalSize uint64) (*UploadSession, error) {
 	ext := strings.ToLower(filepath.Ext(fileName))
 	contentType, supported := SUPPORTED_EXTENSIONS[ext]
 	if !supported {
@@ -352,16 +333,15 @@ func (sm *SessionManager) CreateSession(userID, email, fileName string, totalChu
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	s3Key := fmt.Sprintf("%s/%s/%s", userID, timestamp, fileName)
-	sessionID := fmt.Sprintf("%s_%d", userID, time.Now().UnixNano())
+	s3Key := fmt.Sprintf("%s/%s/%s", emailID, timestamp, fileName)
+	sessionID := fmt.Sprintf("%s_%d", emailID, time.Now().UnixNano())
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	session := &UploadSession{
 		SessionID:      sessionID,
-		UserID:         userID,
-		Email:          email,
+		EmailID:        emailID,
 		FileName:       fileName,
 		S3Key:          s3Key,
 		FileExtension:  ext,
@@ -377,8 +357,8 @@ func (sm *SessionManager) CreateSession(userID, email, fileName string, totalChu
 	}
 
 	sm.sessions[sessionID] = session
-	log.Printf("📦 Created session: %s (user: %s, file: %s, size: %.2f MB)",
-		sessionID, userID, fileName, float64(totalSize)/(1024*1024))
+	log.Printf("📦 Created session: %s (email: %s, file: %s, size: %.2f MB)",
+		sessionID, emailID, fileName, float64(totalSize)/(1024*1024))
 
 	return session, nil
 }
@@ -429,85 +409,66 @@ type Server struct {
 	tokenMgr   *TokenManager
 }
 
-// Middleware to extract JWT and get user info (no verification)
-func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "Missing authorization header", http.StatusUnauthorized)
-			return
-		}
-
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// Decode JWT without verification
-		claims, err := decodeJWTWithoutVerification(token)
-		if err != nil {
-			log.Printf("❌ Failed to decode token: %v", err)
-			http.Error(w, "Invalid token format", http.StatusUnauthorized)
-			return
-		}
-
-		// Check expiration
-		if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
-			http.Error(w, "Token expired", http.StatusUnauthorized)
-			return
-		}
-
-		// Use public_id as user_id (or sub as fallback)
-		userID := claims.PublicID
-		if userID == "" {
-			userID = claims.Sub
-		}
-
-		log.Printf("🔓 Token decoded - User: %s, Email: %s, Role: %s", userID, claims.Sub, claims.Role)
-
-		// Add user info to context
-		ctx := context.WithValue(r.Context(), "userID", userID)
-		ctx = context.WithValue(ctx, "email", claims.Sub)
-		ctx = context.WithValue(ctx, "role", claims.Role)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	}
-}
-
 func (s *Server) handleInitUpload(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(string)
-	email := r.Context().Value("email").(string)
+	log.Printf("📥 Received init upload request from %s", r.RemoteAddr)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
+	}
 
 	var req struct {
+		EmailID     string `json:"email_id"`
 		Filename    string `json:"filename"`
 		FileSize    uint64 `json:"file_size"`
 		TotalChunks uint32 `json:"total_chunks"`
 		ChunkSize   uint32 `json:"chunk_size"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
 		return
 	}
 
-	session, err := s.sessionMgr.CreateSession(userID, email, req.Filename, req.TotalChunks, req.ChunkSize, req.FileSize)
+	if req.EmailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
+	}
+
+	if req.Filename == "" {
+		respondError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
+
+	session, err := s.sessionMgr.CreateSession(req.EmailID, req.Filename, req.TotalChunks, req.ChunkSize, req.FileSize)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Initialize S3 multipart upload
 	result, err := s.s3Client.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
 		Bucket:      aws.String(s.s3Client.bucket),
 		Key:         aws.String(session.S3Key),
 		ContentType: aws.String(session.ContentType),
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to initialize S3 upload: %v", err), http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to initialize S3 upload: %v", err))
 		return
 	}
 
 	session.UploadID = *result.UploadId
 	log.Printf("✅ S3 multipart upload initialized: %s", session.UploadID)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	respondJSON(w, http.StatusOK, map[string]string{
 		"session_id": session.SessionID,
 		"s3_key":     session.S3Key,
 		"upload_id":  session.UploadID,
@@ -515,44 +476,44 @@ func (s *Server) handleInitUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(string)
-
+	emailID := r.FormValue("email_id")
 	sessionID := r.FormValue("session_id")
 	chunkIndexStr := r.FormValue("chunk_index")
 
-	chunkIndex, _ := strconv.ParseUint(chunkIndexStr, 10, 32)
+	if emailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
+	}
 
+	chunkIndex, _ := strconv.ParseUint(chunkIndexStr, 10, 32)
 	session := s.sessionMgr.GetSession(sessionID)
 	if session == nil {
-		http.Error(w, "Invalid session ID", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "Invalid session ID")
 		return
 	}
 
-	if session.UserID != userID {
-		http.Error(w, "Unauthorized", http.StatusForbidden)
+	if session.EmailID != emailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
 		return
 	}
 
-	// Read chunk data
 	file, _, err := r.FormFile("chunk")
 	if err != nil {
-		http.Error(w, "Failed to read chunk", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "Failed to read chunk")
 		return
 	}
 	defer file.Close()
 
 	chunkData, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "Failed to read chunk data", http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, "Failed to read chunk data")
 		return
 	}
 
-	// Calculate hash
 	hash := sha256.Sum256(chunkData)
 	hashStr := hex.EncodeToString(hash[:])
-
-	// Upload to S3
 	partNumber := int32(chunkIndex) + 1
+
 	result, err := s.s3Client.client.UploadPart(context.Background(), &s3.UploadPartInput{
 		Bucket:     aws.String(s.s3Client.bucket),
 		Key:        aws.String(session.S3Key),
@@ -561,7 +522,7 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		Body:       bytes.NewReader(chunkData),
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("S3 upload failed: %v", err), http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("S3 upload failed: %v", err))
 		return
 	}
 
@@ -570,14 +531,13 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("📦 Chunk %d/%d uploaded (%.1f%%)", received, total, float64(received)/float64(total)*100)
 
-	// Check if upload is complete
+	// Auto-finalize if complete (handling this cleanly in finalizeUpload for idempotency)
 	if session.IsComplete() {
 		s.finalizeUpload(w, session)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success":     true,
 		"duplicate":   isDuplicate,
 		"chunk_index": chunkIndex,
@@ -587,7 +547,34 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// FIX: Made this function idempotent to prevent "NoSuchUpload" on double calls
 func (s *Server) finalizeUpload(w http.ResponseWriter, session *UploadSession) {
+	session.mu.Lock()
+	if session.State == "completed" {
+		session.mu.Unlock()
+		log.Printf("⚠️ Upload %s already completed, returning cached success", session.SessionID)
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"completed": true,
+			"s3_key":    session.S3Key,
+			"file_size": session.TotalSize,
+		})
+		return
+	}
+
+	if session.State == "finalizing" {
+		session.mu.Unlock()
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"completed": true,
+			"status":    "finalizing",
+		})
+		return
+	}
+
+	session.State = "finalizing"
+	session.mu.Unlock()
+
 	log.Printf("🔄 Finalizing upload: %s", session.SessionID)
 
 	_, err := s.s3Client.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
@@ -598,8 +585,19 @@ func (s *Server) finalizeUpload(w http.ResponseWriter, session *UploadSession) {
 			Parts: session.CompletedParts,
 		},
 	})
+
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to complete upload: %v", err), http.StatusInternalServerError)
+		// If it failed, it might have been completed by another thread or process
+		// But in most cases, this is a genuine error or the ID is invalid.
+		// For robustness, if it's "NoSuchUpload", we could check if object exists,
+		// but typically we should just error or reset.
+
+		// Reset state to allow retry if it was a network glitch
+		session.mu.Lock()
+		session.State = "initialized"
+		session.mu.Unlock()
+
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to complete upload: %v", err))
 		return
 	}
 
@@ -608,10 +606,9 @@ func (s *Server) finalizeUpload(w http.ResponseWriter, session *UploadSession) {
 	session.UpdatedAt = time.Now()
 	session.mu.Unlock()
 
-	log.Printf("✅ Upload completed: %s (%.2f MB)", session.FileName, float64(session.TotalSize)/(1024*1024))
+	log.Printf("✅ Upload completed: %s", session.FileName)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"success":   true,
 		"completed": true,
 		"s3_key":    session.S3Key,
@@ -620,46 +617,102 @@ func (s *Server) finalizeUpload(w http.ResponseWriter, session *UploadSession) {
 }
 
 func (s *Server) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(string)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
+	}
 
 	var req struct {
+		EmailID   string `json:"email_id"`
 		SessionID string `json:"session_id"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
 		return
 	}
 
 	session := s.sessionMgr.GetSession(req.SessionID)
 	if session == nil {
-		http.Error(w, "Invalid session ID", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "Invalid session ID")
 		return
 	}
 
-	if session.UserID != userID {
-		http.Error(w, "Unauthorized", http.StatusForbidden)
+	if session.EmailID != req.EmailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
 		return
 	}
 
 	if !session.IsComplete() {
-		http.Error(w, "Upload not complete", http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "Upload not complete")
 		return
 	}
 
 	s.finalizeUpload(w, session)
 }
 
-func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(string)
+func (s *Server) handleCancelUpload(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🚫 Received cancel upload request")
 
-	prefix := userID + "/"
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
+	}
+
+	var req struct {
+		EmailID   string `json:"email_id"`
+		SessionID string `json:"session_id"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+
+	session := s.sessionMgr.GetSession(req.SessionID)
+	if session == nil {
+		respondJSON(w, http.StatusOK, map[string]string{"status": "session_not_found_or_already_deleted"})
+		return
+	}
+
+	if session.EmailID != req.EmailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
+		return
+	}
+
+	if session.UploadID != "" {
+		_, err := s.s3Client.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.s3Client.bucket),
+			Key:      aws.String(session.S3Key),
+			UploadId: aws.String(session.UploadID),
+		})
+		if err != nil {
+			log.Printf("⚠️ Failed to abort S3 upload: %v", err)
+		} else {
+			log.Printf("✅ S3 upload aborted for session: %s", req.SessionID)
+		}
+	}
+
+	s.sessionMgr.DeleteSession(req.SessionID)
+	respondJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	emailID := r.URL.Query().Get("email_id")
+	if emailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
+	}
+
+	prefix := emailID + "/"
 	result, err := s.s3Client.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.s3Client.bucket),
 		Prefix: aws.String(prefix),
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to list files: %v", err), http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list files: %v", err))
 		return
 	}
 
@@ -672,34 +725,42 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"files": files,
 		"count": len(files),
 	})
 }
 
 func (s *Server) handleRequestStreamingToken(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("userID").(string)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
+	}
 
 	var req struct {
-		S3Key string `json:"s3_key"`
+		EmailID string `json:"email_id"`
+		S3Key   string `json:"s3_key"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
 		return
 	}
 
-	if !strings.HasPrefix(req.S3Key, userID+"/") {
-		http.Error(w, "Unauthorized: file does not belong to user", http.StatusForbidden)
+	if req.EmailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
 		return
 	}
 
-	token := s.tokenMgr.CreateStreamingToken(userID, req.S3Key)
+	if !strings.HasPrefix(req.S3Key, req.EmailID+"/") {
+		respondError(w, http.StatusForbidden, "Unauthorized")
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	token := s.tokenMgr.CreateStreamingToken(req.EmailID, req.S3Key)
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"token":      token,
 		"expires_in": int(TOKEN_LIFETIME.Seconds()),
 		"s3_key":     req.S3Key,
@@ -709,13 +770,13 @@ func (s *Server) handleRequestStreamingToken(w http.ResponseWriter, r *http.Requ
 func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
-		http.Error(w, "Missing streaming token", http.StatusUnauthorized)
+		respondError(w, http.StatusUnauthorized, "Missing streaming token")
 		return
 	}
 
 	streamingToken, valid := s.tokenMgr.ValidateStreamingToken(token)
 	if !valid {
-		http.Error(w, "Invalid or expired streaming token", http.StatusForbidden)
+		respondError(w, http.StatusForbidden, "Invalid or expired streaming token")
 		return
 	}
 
@@ -726,7 +787,7 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {
-		http.Error(w, "File not found", http.StatusNotFound)
+		respondError(w, http.StatusNotFound, "File not found")
 		return
 	}
 
@@ -735,12 +796,20 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 	if headResult.ContentType != nil {
 		contentType = *headResult.ContentType
 	}
+	if contentType == "" || contentType == "application/octet-stream" {
+		ext := strings.ToLower(filepath.Ext(s3Key))
+		if ct, ok := SUPPORTED_EXTENSIONS[ext]; ok {
+			contentType = ct
+		}
+	}
+
+	// FIX: Force inline content disposition for preview support
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filepath.Base(s3Key)))
 
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader != "" {
 		var start, end int64
 		fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
-
 		if end == 0 || end >= fileSize {
 			end = fileSize - 1
 		}
@@ -751,7 +820,7 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 		})
 		if err != nil {
-			http.Error(w, "Failed to stream file", http.StatusInternalServerError)
+			respondError(w, http.StatusInternalServerError, "Failed to stream file")
 			return
 		}
 		defer result.Body.Close()
@@ -771,7 +840,7 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {
-		http.Error(w, "Failed to stream file", http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, "Failed to stream file")
 		return
 	}
 	defer result.Body.Close()
@@ -784,20 +853,11 @@ func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
-		"time":   time.Now().Format(time.RFC3339),
-	})
+	respondJSON(w, http.StatusOK, map[string]string{"status": "healthy", "time": time.Now().Format(time.RFC3339)})
 }
 
-// ============================================
-// Main
-// ============================================
-
 func main() {
-	log.Printf("🚀 Starting Simple File Upload Server (JWT without verification)")
-
+	log.Printf("🚀 Starting Fixed Upload Server (Idempotent)")
 	s3Client, err := NewS3Client()
 	if err != nil {
 		log.Fatalf("❌ Failed to initialize S3: %v", err)
@@ -805,43 +865,29 @@ func main() {
 
 	tokenMgr := NewTokenManager()
 	sessionMgr := NewSessionManager(s3Client)
-
-	server := &Server{
-		sessionMgr: sessionMgr,
-		s3Client:   s3Client,
-		tokenMgr:   tokenMgr,
-	}
+	server := &Server{sessionMgr: sessionMgr, s3Client: s3Client, tokenMgr: tokenMgr}
 
 	router := mux.NewRouter()
-
-	router.HandleFunc("/health", server.handleHealth).Methods("GET")
-
-	// Upload endpoints (require JWT)
-	router.HandleFunc("/upload/init", server.authMiddleware(server.handleInitUpload)).Methods("POST")
-	router.HandleFunc("/upload/chunk", server.authMiddleware(server.handleUploadChunk)).Methods("POST")
-	router.HandleFunc("/upload/complete", server.authMiddleware(server.handleCompleteUpload)).Methods("POST")
-
-	// File management (require JWT)
-	router.HandleFunc("/files", server.authMiddleware(server.handleListFiles)).Methods("GET")
-	router.HandleFunc("/files/streaming-token", server.authMiddleware(server.handleRequestStreamingToken)).Methods("POST")
-
-	// Streaming endpoint (uses query param token)
-	router.HandleFunc("/stream", server.handleStreamFile).Methods("GET")
+	router.HandleFunc("/health", server.handleHealth).Methods("GET", "OPTIONS")
+	router.HandleFunc("/upload/init", server.handleInitUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/chunk", server.handleUploadChunk).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/complete", server.handleCompleteUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/cancel", server.handleCancelUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/files", server.handleListFiles).Methods("GET", "OPTIONS")
+	router.HandleFunc("/files/streaming-token", server.handleRequestStreamingToken).Methods("POST", "OPTIONS")
+	router.HandleFunc("/stream", server.handleStreamFile).Methods("GET", "OPTIONS")
 
 	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders: []string{"*"},
+		ExposedHeaders: []string{"Content-Length", "Content-Type", "Content-Range", "Accept-Ranges", "Content-Disposition"},
+		AllowCredentials: false,
+		MaxAge: 86400,
 	})
 
-	handler := c.Handler(router)
-
 	log.Printf("✅ Server listening on %s", HTTP_PORT)
-	log.Printf("🔓 JWT tokens decoded without signature verification")
-	log.Printf("📁 Files stored as: user_id/timestamp/filename")
-
-	if err := http.ListenAndServe(HTTP_PORT, handler); err != nil {
+	if err := http.ListenAndServe(HTTP_PORT, c.Handler(router)); err != nil {
 		log.Fatalf("❌ Server failed: %v", err)
 	}
 }

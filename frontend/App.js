@@ -12,11 +12,7 @@ import HomeScreen from "./screens/HomeScreen";
 const Stack = createNativeStackNavigator();
 
 // NGROK API base URL
-<<<<<<< HEAD
-const API_BASE_URL = "http://localhost:5000";
-=======
 const API_BASE_URL = "https://spadiceous-unfocussing-maureen.ngrok-free.dev";
->>>>>>> 1de8355 (bull shit)
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
