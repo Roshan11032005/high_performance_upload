@@ -44,7 +44,8 @@ def create_app():
         app,
         supports_credentials=True,
         origins=[
-            "http://localhost:3000",  # react native dev
+            "http://localhost:3000",
+            "http://localhost:8082"  # react native dev
         ]
     )
 
