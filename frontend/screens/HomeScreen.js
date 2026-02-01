@@ -16,64 +16,21 @@ import { StatusBar } from "expo-status-bar";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
-import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { Video, ResizeMode } from "expo-av";
-import { WebView } from "react-native-webview";
+import * as Sharing from "expo-sharing";
 
 /* ---------------- CONSTANTS ---------------- */
 // ⚠️ IMPORTANT: Update this URL every time you restart ngrok ⚠️
 const API_BASE_URL = "https://27f7876d45e6.ngrok-free.app";
 
-/* ---------------- UPLOAD BANDWIDTH PROBE ---------------- */
-async function measureUploadNetwork() {
-  const UPLOAD_SIZE = 256 * 1024; // 256 KB
-  const payload = new Uint8Array(UPLOAD_SIZE);
-  const start = Date.now();
-  try {
-    await fetch("https://httpbin.org/post", {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: payload,
-    });
-    const timeMs = Date.now() - start;
-    const bandwidthMbps = (UPLOAD_SIZE * 8) / (timeMs / 1000) / (1024 * 1024);
-    return {
-      rttMs: Math.max(timeMs, 20),
-      bandwidthMbps: Math.max(bandwidthMbps, 1),
-    };
-  } catch (error) {
-    return { rttMs: 100, bandwidthMbps: 5 };
-  }
-}
-
-/* ---------------- CHUNK OPTIMIZER ---------------- */
-function calculateInitialConfig({
-  fileSizeBytes,
-  bandwidthMbps,
-  rttMs,
-  cpuCores,
-  freeMemoryMB,
-}) {
-  const bandwidthBps = (bandwidthMbps * 1024 * 1024) / 8;
-  const rttSec = rttMs / 1000;
-  let chunkSize = bandwidthBps * rttSec * 2;
-  const MIN_CHUNK = 5 * 1024 * 1024;
-  const MAX_CHUNK = 100 * 1024 * 1024;
-  chunkSize = Math.max(MIN_CHUNK, Math.min(chunkSize, MAX_CHUNK));
-  const connCpu = cpuCores * 2;
-  const connMem = freeMemoryMB / (chunkSize / (1024 * 1024));
-  const connNet = bandwidthBps / chunkSize;
-  const connections = Math.max(
-    1,
-    Math.floor(Math.min(connCpu, connMem, connNet, 16)),
-  );
+/* ---------------- CONFIG UTILS ---------------- */
+function calculateInitialConfig({ fileSizeBytes }) {
+  // Use a fixed safe chunk size (5MB) to ensure S3 compatibility
+  const chunkSize = 5 * 1024 * 1024;
   return {
-    chunkSize: Math.floor(chunkSize),
-    connections,
+    chunkSize,
     totalChunks: Math.ceil(fileSizeBytes / chunkSize),
-    bandwidthBps,
-    bandwidthMbps,
   };
 }
 
@@ -90,106 +47,103 @@ class HTTPUploader {
     this.onError = null;
     this.currentChunk = 0;
     this.isPaused = false;
-    this.s3Key = "";
-    this.uploadedChunks = new Set();
-  }
-
-  async connect() {
-    return Promise.resolve();
   }
 
   async initializeUpload(file, config) {
     this.file = file;
     this.uploadConfig = config;
     this.currentChunk = 0;
-    this.uploadedChunks.clear();
     this.isPaused = false;
-    const fileName = file.name || "file";
-    const fileSize = file.size || file.fileSize;
-
-    const payload = {
-      email_id: this.emailID,
-      filename: fileName,
-      file_size: fileSize,
-      total_chunks: config.totalChunks,
-      chunk_size: config.chunkSize,
-    };
 
     try {
       const response = await fetch(`${this.apiBaseUrl}/upload/init`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          email_id: this.emailID,
+          filename: file.name,
+          file_size: file.size,
+          total_chunks: config.totalChunks,
+          chunk_size: config.chunkSize,
+        }),
       });
-      const responseText = await response.text();
-      if (!response.ok) throw new Error(`Init failed: ${responseText}`);
-      const data = JSON.parse(responseText);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Init failed");
+
       this.sessionID = data.session_id;
-      this.s3Key = data.s3_key;
-      this.startChunkUpload();
+      this.uploadNextChunk();
     } catch (error) {
       if (this.onError) this.onError(error.message);
     }
   }
 
-  async startChunkUpload() {
-    this.currentChunk = 0;
-    this.uploadNextChunk();
-  }
-
+  // ---------------------------------------------------------
+  // ✅ FIXED: uploadNextChunk using Temporary Files logic
+  // ---------------------------------------------------------
   async uploadNextChunk() {
     if (this.isPaused) return;
     if (this.currentChunk >= this.uploadConfig.totalChunks) {
-      await this.finalizeUpload();
+      this.finalizeUpload();
       return;
     }
-    const fileUri = this.file.uri;
-    const fileSize = this.file.size || this.file.fileSize;
-    const chunkSize = this.uploadConfig.chunkSize;
-    const start = this.currentChunk * chunkSize;
-    const end = Math.min(start + chunkSize, fileSize);
-    const actualChunkSize = end - start;
+
+    const start = this.currentChunk * this.uploadConfig.chunkSize;
+    const end = Math.min(start + this.uploadConfig.chunkSize, this.file.size);
+    const length = end - start;
+    let tempChunkPath = null;
 
     try {
-      const chunkData = await FileSystem.readAsStringAsync(fileUri, {
+      // 1. Read chunk as Base64
+      const chunkData = await FileSystem.readAsStringAsync(this.file.uri, {
         encoding: "base64",
         position: start,
-        length: actualChunkSize,
+        length: length,
       });
 
+      // 2. Write to temp file
+      tempChunkPath = `${FileSystem.cacheDirectory}chunk_${this.sessionID}_${this.currentChunk}.bin`;
+      await FileSystem.writeAsStringAsync(tempChunkPath, chunkData, {
+        encoding: "base64",
+      });
+
+      // 3. Create FormData with URI
       const formData = new FormData();
       formData.append("email_id", this.emailID);
       formData.append("session_id", this.sessionID);
       formData.append("chunk_index", this.currentChunk.toString());
-      formData.append("total_chunks", this.uploadConfig.totalChunks.toString());
 
-      const blob = await fetch(
-        `data:application/octet-stream;base64,${chunkData}`,
-      ).then((r) => r.blob());
-      formData.append("chunk", blob, `chunk_${this.currentChunk}`);
+      formData.append("chunk", {
+        uri: tempChunkPath,
+        name: `chunk_${this.currentChunk}.bin`,
+        type: "application/octet-stream",
+      });
 
       const response = await fetch(`${this.apiBaseUrl}/upload/chunk`, {
         method: "POST",
         body: formData,
+        headers: { Accept: "application/json" },
       });
 
-      if (!response.ok) throw new Error("Chunk upload failed");
-      const responseText = await response.text();
-      const data = JSON.parse(responseText);
+      // 4. Cleanup
+      await FileSystem.deleteAsync(tempChunkPath, { idempotent: true });
 
-      this.uploadedChunks.add(this.currentChunk);
-      const progress = data.progress || 0;
-      if (this.onProgress) this.onProgress(progress);
-
-      if (data.completed) {
-        if (this.onComplete) this.onComplete(data.s3_key, data.file_size);
-        return;
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Upload failed: ${errText}`);
       }
+
+      const progressPercent =
+        ((this.currentChunk + 1) / this.uploadConfig.totalChunks) * 100;
+      if (this.onProgress) this.onProgress(progressPercent);
+
       this.currentChunk++;
       setTimeout(() => this.uploadNextChunk(), 10);
-    } catch (error) {
-      if (this.onError)
-        this.onError(`Failed to upload chunk: ${error.message}`);
+    } catch (e) {
+      if (tempChunkPath)
+        await FileSystem.deleteAsync(tempChunkPath, { idempotent: true }).catch(
+          () => {},
+        );
+      if (this.onError) this.onError(e.message);
     }
   }
 
@@ -203,32 +157,16 @@ class HTTPUploader {
           session_id: this.sessionID,
         }),
       });
-      if (!response.ok) throw new Error("Finalize failed");
+
       const data = await response.json();
-      if (this.onComplete) this.onComplete(data.s3_key, data.file_size || 0);
-    } catch (error) {
-      if (this.onError) this.onError(error.message);
-    }
-  }
-
-  async cancel() {
-    this.isPaused = true;
-    try {
-      await fetch(`${this.apiBaseUrl}/upload/cancel`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email_id: this.emailID,
-          session_id: this.sessionID,
-        }),
-      });
+      if (!response.ok) throw new Error(data.error || "Finalize failed");
+      if (this.onComplete) this.onComplete();
     } catch (e) {
-      console.warn("Cancel failed", e);
+      if (this.onError) this.onError(e.message);
     }
-    this.disconnect();
   }
 
-  pause() {
+  cancel() {
     this.isPaused = true;
   }
   resume() {
@@ -237,167 +175,105 @@ class HTTPUploader {
       this.uploadNextChunk();
     }
   }
-  disconnect() {
+  pause() {
     this.isPaused = true;
-    this.file = null;
-    this.sessionID = "";
   }
 }
 
-/* ---------------- FILE BROWSER COMPONENT ---------------- */
+/* ---------------- FILE BROWSER (DOWNLOAD & VIEW) ---------------- */
 function FileBrowser({ emailID, apiBaseUrl, onClose }) {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [streamingFile, setStreamingFile] = useState(null);
-  const [streamingToken, setStreamingToken] = useState(null);
+  const [downloading, setDownloading] = useState(false);
+  const [viewingFile, setViewingFile] = useState(null);
 
   useEffect(() => {
     loadFiles();
   }, []);
-
-  useEffect(() => {
-    let interval;
-    if (streamingFile && streamingToken) {
-      interval = setInterval(
-        async () => {
-          const newToken = await requestStreamingToken(streamingFile.key);
-          if (newToken) setStreamingToken(newToken);
-        },
-        4 * 60 * 1000,
-      );
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [streamingFile, streamingToken]);
 
   const loadFiles = async () => {
     try {
       const response = await fetch(
         `${apiBaseUrl}/files?email_id=${encodeURIComponent(emailID)}`,
       );
-      if (!response.ok) throw new Error("Failed to load files");
       const data = await response.json();
       setFiles(data.files || []);
     } catch (error) {
-      Alert.alert("Error", "Failed to load files. Check API URL.");
+      Alert.alert("Error", "Failed to load files");
     } finally {
       setLoading(false);
     }
   };
 
-  const requestStreamingToken = async (s3Key) => {
+  const downloadAndPreview = async (file) => {
+    setDownloading(true);
     try {
-      const response = await fetch(`${apiBaseUrl}/files/streaming-token`, {
+      const tokenResp = await fetch(`${apiBaseUrl}/files/streaming-token`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email_id: emailID, s3_key: s3Key }),
+        body: JSON.stringify({ email_id: emailID, s3_key: file.key }),
       });
-      if (!response.ok) throw new Error("Failed to get token");
-      const data = await response.json();
-      return data.token;
+      if (!tokenResp.ok) throw new Error("Failed to get token");
+
+      const { token } = await tokenResp.json();
+      const fileName = file.key.split("/").pop();
+      const localUri = FileSystem.cacheDirectory + `${Date.now()}_${fileName}`;
+
+      await FileSystem.downloadAsync(
+        `${apiBaseUrl}/stream?token=${token}`,
+        localUri,
+      );
+
+      const ext = fileName.toLowerCase().split(".").pop();
+      if (["mp4", "mov", "m4v", "jpg", "png", "jpeg", "webp"].includes(ext)) {
+        setViewingFile({
+          uri: localUri,
+          type: ["jpg", "png", "jpeg", "webp"].includes(ext)
+            ? "image"
+            : "video",
+          name: fileName,
+        });
+      } else {
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(localUri);
+        } else {
+          Alert.alert("Error", "Sharing not available");
+        }
+      }
     } catch (error) {
-      return null;
+      Alert.alert("Error", "Failed to download");
+    } finally {
+      setDownloading(false);
     }
   };
 
-  const playFile = async (file) => {
-    const token = await requestStreamingToken(file.key);
-    if (!token) {
-      Alert.alert("Error", "Unable to authorize playback");
-      return;
-    }
-    setStreamingToken(token);
-    setStreamingFile(file);
-  };
-
-  const getFileType = (key) => {
-    const ext = key.toLowerCase().split(".").pop();
-    if (["mp4", "mov", "avi", "mkv"].includes(ext)) return "video";
-    if (["mp3", "wav", "m4a"].includes(ext)) return "audio";
-    if (["jpg", "jpeg", "png", "gif", "webp"].includes(ext)) return "image";
-    if (ext === "pdf") return "pdf";
-    return "file";
-  };
-
-  const formatFileSize = (bytes) => {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB";
-    if (bytes < 1024 * 1024 * 1024)
-      return (bytes / (1024 * 1024)).toFixed(2) + " MB";
-    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
-  };
-
-  if (streamingFile && streamingToken) {
-    const streamUrl = `${apiBaseUrl}/stream?token=${streamingToken}`;
-    const fileType = getFileType(streamingFile.key);
-
-    console.log(`🎥 Streaming: ${fileType} from ${streamUrl}`);
-
-    // Android PDF Hack: Use Google Docs Viewer
-    const isAndroidPdf = Platform.OS === "android" && fileType === "pdf";
-    const finalUri = isAndroidPdf
-      ? `https://docs.google.com/gview?embedded=true&url=${encodeURIComponent(streamUrl)}`
-      : streamUrl;
-
+  if (viewingFile) {
     return (
       <LinearGradient colors={["#000", "#111"]} style={styles.container}>
-        <StatusBar hidden />
         <SafeAreaView style={styles.safeArea}>
           <View style={styles.streamHeader}>
             <TouchableOpacity
-              onPress={() => {
-                setStreamingFile(null);
-                setStreamingToken(null);
-              }}
+              onPress={() => setViewingFile(null)}
               style={styles.backButton}
             >
               <Ionicons name="close" size={28} color="#FFF" />
             </TouchableOpacity>
-            <Text style={styles.streamTitle} numberOfLines={1}>
-              {streamingFile.key.split("/").pop()}
-            </Text>
+            <Text style={styles.streamTitle}>{viewingFile.name}</Text>
           </View>
-
           <View style={styles.playerContainer}>
-            {fileType === "video" && (
+            {viewingFile.type === "video" ? (
               <Video
-                source={{ uri: streamUrl }}
+                source={{ uri: viewingFile.uri }}
                 style={styles.fullscreenPlayer}
                 useNativeControls
                 resizeMode={ResizeMode.CONTAIN}
                 shouldPlay
-                onError={(e) =>
-                  Alert.alert("Video Error", `Could not play video. Code: ${e}`)
-                }
               />
-            )}
-
-            {fileType === "audio" && (
-              <View style={styles.audioPlayer}>
-                <Ionicons name="musical-notes" size={80} color="#4A90E2" />
-                <Video
-                  source={{ uri: streamUrl }}
-                  useNativeControls
-                  shouldPlay
-                />
-              </View>
-            )}
-
-            {fileType === "image" && (
+            ) : (
               <Image
-                source={{ uri: streamUrl }}
+                source={{ uri: viewingFile.uri }}
                 style={styles.fullscreenPlayer}
                 resizeMode="contain"
-              />
-            )}
-
-            {fileType === "pdf" && (
-              <WebView
-                source={{ uri: finalUri }}
-                style={{ flex: 1, backgroundColor: "#fff" }}
-                scalesPageToFit={true}
-                onError={(e) => console.log("WebView Error", e)}
               />
             )}
           </View>
@@ -422,72 +298,47 @@ function FileBrowser({ emailID, apiBaseUrl, onClose }) {
             <Ionicons name="refresh" size={24} color="#FFF" />
           </TouchableOpacity>
         </View>
-
-        {loading ? (
-          <ActivityIndicator
-            size="large"
-            color="#4A90E2"
-            style={{ marginTop: 50 }}
-          />
-        ) : files.length === 0 ? (
-          <View
-            style={{ flex: 1, justifyContent: "center", alignItems: "center" }}
-          >
-            <Text style={{ color: "#FFF" }}>No files found for this user.</Text>
+        {downloading && (
+          <View style={styles.loadingOverlay}>
+            <View style={styles.loadingBox}>
+              <ActivityIndicator size="large" color="#4A90E2" />
+              <Text style={styles.loadingText}>Opening Preview...</Text>
+            </View>
           </View>
-        ) : (
-          <FlatList
-            data={files}
-            keyExtractor={(item) => item.key}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                style={styles.fileItem}
-                onPress={() => playFile(item)}
-              >
-                <View style={styles.fileIcon}>
-                  <Ionicons
-                    name={
-                      getFileType(item.key) === "video"
-                        ? "videocam"
-                        : getFileType(item.key) === "pdf"
-                          ? "document-text"
-                          : "document"
-                    }
-                    size={24}
-                    color="#4A90E2"
-                  />
-                </View>
-                <View style={styles.fileInfo}>
-                  <Text style={styles.fileName}>
-                    {item.key.split("/").pop()}
-                  </Text>
-                  <Text style={styles.fileSize}>
-                    {formatFileSize(item.size)}
-                  </Text>
-                </View>
-                <Ionicons
-                  name="play-circle-outline"
-                  size={28}
-                  color="#10B981"
-                />
-              </TouchableOpacity>
-            )}
-            contentContainerStyle={styles.fileList}
-          />
         )}
+        <FlatList
+          data={files}
+          keyExtractor={(item) => item.key}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              style={styles.fileItem}
+              onPress={() => downloadAndPreview(item)}
+            >
+              <View style={styles.fileIcon}>
+                <Ionicons name="document-text" size={24} color="#4A90E2" />
+              </View>
+              <View style={styles.fileInfo}>
+                <Text style={styles.fileName}>{item.key.split("/").pop()}</Text>
+                <Text style={styles.fileSize}>
+                  {(item.size / 1024 / 1024).toFixed(2)} MB
+                </Text>
+              </View>
+              <Ionicons name="play-circle-outline" size={28} color="#10B981" />
+            </TouchableOpacity>
+          )}
+        />
       </SafeAreaView>
     </LinearGradient>
   );
 }
 
-/* ---------------- MAIN HOME SCREEN COMPONENT ---------------- */
+/* ---------------- MAIN SCREEN ---------------- */
 export default function HomeScreen({ onLogout, userEmail }) {
   const [showUpload, setShowUpload] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
   const [file, setFile] = useState(null);
-  const [config, setConfig] = useState(null);
   const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const [progress, setProgress] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const uploaderRef = useRef(null);
 
@@ -496,80 +347,91 @@ export default function HomeScreen({ onLogout, userEmail }) {
       uploaderRef.current = new HTTPUploader(userEmail, API_BASE_URL);
   }, [userEmail]);
 
-  const pickDocument = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
+  const pickFile = async () => {
+    const res = await DocumentPicker.getDocumentAsync({
       type: "*/*",
       copyToCacheDirectory: true,
     });
-    if (!result.canceled) {
-      setFile(result.assets[0]);
-      measureAndCalculate(result.assets[0]);
-    }
-  };
-
-  const measureAndCalculate = async (selectedFile) => {
-    try {
-      const net = await measureUploadNetwork();
-      const calculatedConfig = calculateInitialConfig({
-        fileSizeBytes: selectedFile.size,
-        bandwidthMbps: net.bandwidthMbps,
-        rttMs: net.rttMs,
-        cpuCores: 4,
-        freeMemoryMB: 2048,
-      });
-      setConfig(calculatedConfig);
-    } catch (e) {
-      Alert.alert("Error", "Config calculation failed");
-    }
+    if (!res.canceled) setFile(res.assets[0]);
   };
 
   const startUpload = async () => {
-    if (!file || !config || !uploaderRef.current) return;
+    if (!file || !uploaderRef.current) return;
     setUploading(true);
+    setProgress(0);
     setIsPaused(false);
-    setUploadProgress(0);
-    const uploader = uploaderRef.current;
-    uploader.onProgress = (progress) => setUploadProgress(progress);
-    uploader.onComplete = () => {
+    const config = calculateInitialConfig({ fileSizeBytes: file.size });
+
+    uploaderRef.current.onProgress = (p) => setProgress(p);
+    uploaderRef.current.onComplete = () => {
       setUploading(false);
-      Alert.alert("Success", "Upload completed!");
+      Alert.alert("Success", "Upload Completed!");
       setFile(null);
-      setConfig(null);
       setShowUpload(false);
     };
-    uploader.onError = (err) => {
+    uploaderRef.current.onError = (e) => {
       setUploading(false);
-      Alert.alert("Error", err);
+      Alert.alert("Error", e);
     };
-    await uploader.initializeUpload(file, config);
+    await uploaderRef.current.initializeUpload(file, config);
   };
 
   const togglePause = () => {
     if (uploaderRef.current) {
-      if (isPaused) {
-        uploaderRef.current.resume();
-        setIsPaused(false);
-      } else {
-        uploaderRef.current.pause();
-        setIsPaused(true);
-      }
+      isPaused ? uploaderRef.current.resume() : uploaderRef.current.pause();
+      setIsPaused(!isPaused);
     }
   };
 
   const cancelUpload = () => {
-    Alert.alert("Cancel", "Stop upload?", [
-      { text: "No", style: "cancel" },
-      {
-        text: "Yes",
-        style: "destructive",
-        onPress: () => {
-          if (uploaderRef.current) uploaderRef.current.cancel();
-          setUploading(false);
-          setIsPaused(false);
-          setUploadProgress(0);
-        },
-      },
-    ]);
+    if (uploaderRef.current) uploaderRef.current.cancel();
+    setUploading(false);
+    setFile(null);
+  };
+
+  /* --- HELPER: RENDER LOCAL PREVIEW --- */
+  const renderLocalPreview = () => {
+    if (!file) return null;
+    const isImage =
+      file.mimeType?.startsWith("image/") ||
+      ["jpg", "jpeg", "png", "webp"].some((ext) =>
+        file.name.toLowerCase().endsWith(ext),
+      );
+    const isVideo =
+      file.mimeType?.startsWith("video/") ||
+      ["mp4", "mov", "m4v"].some((ext) =>
+        file.name.toLowerCase().endsWith(ext),
+      );
+
+    if (isImage) {
+      return (
+        <Image
+          source={{ uri: file.uri }}
+          style={styles.localPreviewMedia}
+          resizeMode="contain"
+        />
+      );
+    }
+    if (isVideo) {
+      return (
+        <Video
+          source={{ uri: file.uri }}
+          style={styles.localPreviewMedia}
+          useNativeControls
+          resizeMode={ResizeMode.CONTAIN}
+          isLooping
+        />
+      );
+    }
+    // Default Icon for non-media files
+    return (
+      <Ionicons
+        name="document-text-outline"
+        size={64}
+        color="#FFF"
+        style={{ marginBottom: 16 }}
+      />
+    );
   };
 
   if (showBrowser)
@@ -589,20 +451,17 @@ export default function HomeScreen({ onLogout, userEmail }) {
       >
         <StatusBar style="light" />
         <SafeAreaView style={styles.safeArea}>
-          <ScrollView contentContainerStyle={styles.scrollContent}>
-            <View style={styles.uploadHeader}>
-              <TouchableOpacity onPress={() => setShowUpload(false)}>
-                <Ionicons name="arrow-back" size={24} color="#FFF" />
-              </TouchableOpacity>
-              <Text style={styles.uploadTitle}>Upload</Text>
-              <View style={{ width: 24 }} />
-            </View>
+          <View style={styles.uploadHeader}>
+            <TouchableOpacity onPress={() => setShowUpload(false)}>
+              <Ionicons name="arrow-back" size={24} color="#FFF" />
+            </TouchableOpacity>
+            <Text style={styles.uploadTitle}>Upload File</Text>
+            <View style={{ width: 24 }} />
+          </View>
 
+          <ScrollView contentContainerStyle={styles.scrollContent}>
             {!file ? (
-              <TouchableOpacity
-                style={styles.pickerButton}
-                onPress={pickDocument}
-              >
+              <TouchableOpacity style={styles.pickerButton} onPress={pickFile}>
                 <Ionicons
                   name="cloud-upload-outline"
                   size={48}
@@ -611,15 +470,27 @@ export default function HomeScreen({ onLogout, userEmail }) {
                 <Text style={styles.pickerButtonText}>Select File</Text>
               </TouchableOpacity>
             ) : (
-              <View style={styles.fileInfo}>
+              <View style={styles.fileInfoBox}>
+                {/* PREVIEW RENDERED HERE */}
+                {renderLocalPreview()}
+
                 <Text style={styles.fileName}>{file.name}</Text>
                 <Text style={styles.fileSize}>
-                  {(file.size / (1024 * 1024)).toFixed(2)} MB
+                  {(file.size / 1024 / 1024).toFixed(2)} MB
                 </Text>
+
+                {!uploading && (
+                  <TouchableOpacity
+                    onPress={pickFile}
+                    style={styles.changeFileButton}
+                  >
+                    <Text style={styles.changeFileText}>Change File</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             )}
 
-            {config && !uploading && (
+            {file && !uploading && (
               <TouchableOpacity
                 style={styles.startButton}
                 onPress={startUpload}
@@ -631,15 +502,14 @@ export default function HomeScreen({ onLogout, userEmail }) {
             {uploading && (
               <View style={styles.uploadingContainer}>
                 <Text style={styles.uploadingText}>
-                  {isPaused ? "Paused" : "Uploading..."}{" "}
-                  {uploadProgress.toFixed(1)}%
+                  {isPaused ? "Paused" : "Uploading..."} {progress.toFixed(0)}%
                 </Text>
                 <View style={styles.progressBarContainer}>
                   <View
                     style={[
                       styles.progressBar,
                       {
-                        width: `${uploadProgress}%`,
+                        width: `${progress}%`,
                         backgroundColor: isPaused ? "#F59E0B" : "#10B981",
                       },
                     ]}
@@ -653,11 +523,6 @@ export default function HomeScreen({ onLogout, userEmail }) {
                     ]}
                     onPress={togglePause}
                   >
-                    <Ionicons
-                      name={isPaused ? "play" : "pause"}
-                      size={24}
-                      color="#FFF"
-                    />
                     <Text style={styles.controlButtonText}>
                       {isPaused ? "Resume" : "Pause"}
                     </Text>
@@ -669,7 +534,6 @@ export default function HomeScreen({ onLogout, userEmail }) {
                     ]}
                     onPress={cancelUpload}
                   >
-                    <Ionicons name="close-circle" size={24} color="#FFF" />
                     <Text style={styles.controlButtonText}>Cancel</Text>
                   </TouchableOpacity>
                 </View>
@@ -709,7 +573,7 @@ export default function HomeScreen({ onLogout, userEmail }) {
           >
             <Ionicons name="play-circle" size={40} color="#10B981" />
             <Text style={styles.menuTitle}>My Files</Text>
-            <Text style={styles.menuSubtitle}>Stream Video & View PDF</Text>
+            <Text style={styles.menuSubtitle}>Download & View</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -742,7 +606,8 @@ const styles = StyleSheet.create({
   uploadHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginBottom: 30,
+    alignItems: "center",
+    padding: 20,
   },
   uploadTitle: { fontSize: 20, fontWeight: "bold", color: "#FFF" },
   pickerButton: {
@@ -754,16 +619,31 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     backgroundColor: "rgba(74, 144, 226, 0.1)",
+    marginBottom: 20,
   },
   pickerButtonText: { color: "#4A90E2", fontSize: 18, marginTop: 12 },
-  fileInfo: { alignItems: "center", padding: 20 },
+  fileInfoBox: {
+    alignItems: "center",
+    padding: 20,
+    backgroundColor: "rgba(255,255,255,0.05)",
+    borderRadius: 12,
+  },
   fileName: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: "bold",
     color: "#FFF",
     textAlign: "center",
+    marginTop: 10,
   },
-  fileSize: { color: "#9CA3AF", marginTop: 8 },
+  fileSize: { color: "#9CA3AF", marginTop: 4 },
+  changeFileButton: {
+    marginTop: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    borderRadius: 6,
+  },
+  changeFileText: { color: "#FFF", fontSize: 12 },
   startButton: {
     backgroundColor: "#4A90E2",
     padding: 16,
@@ -788,12 +668,9 @@ const styles = StyleSheet.create({
     marginTop: 20,
   },
   controlButton: {
-    flexDirection: "row",
     paddingHorizontal: 20,
-    paddingVertical: 12,
+    paddingVertical: 10,
     borderRadius: 8,
-    alignItems: "center",
-    gap: 8,
   },
   controlButtonText: { color: "#FFF", fontWeight: "600" },
   browserHeader: {
@@ -803,7 +680,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   browserTitle: { fontSize: 20, fontWeight: "bold", color: "#FFF" },
-  fileList: { padding: 20 },
   fileItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -811,6 +687,7 @@ const styles = StyleSheet.create({
     padding: 16,
     borderRadius: 12,
     marginBottom: 12,
+    marginHorizontal: 20,
   },
   fileIcon: {
     width: 48,
@@ -842,5 +719,29 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   fullscreenPlayer: { width: "100%", height: "100%" },
-  audioPlayer: { alignItems: "center", gap: 20 },
+  loadingOverlay: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 999,
+  },
+  loadingBox: {
+    backgroundColor: "#1A2742",
+    padding: 24,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  loadingText: { color: "#FFF", marginTop: 12 },
+  localPreviewMedia: {
+    width: "100%",
+    height: 200,
+    borderRadius: 8,
+    backgroundColor: "#000",
+    marginBottom: 16,
+  },
 });
