@@ -38,5 +38,15 @@ def create_app():
     app.add_url_rule("/", endpoint="index")
 
     jwt = JWTManager(app)
+    from flask_cors import CORS
+
+    CORS(
+        app,
+        supports_credentials=True,
+        origins=[
+            "http://localhost:3000",  # react native dev
+        ]
+    )
+
 
     return app

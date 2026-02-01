@@ -18,7 +18,7 @@ def register_user(user_name: str, email_id: str, password_hash: str, public_id: 
     with db.engine.begin() as conn:
         conn.execute(
             text(query),
-            {"email_id": email_id, "password_hash": password_hash, "public_id": public_id},
+            {"user_name": user_name, "email_id": email_id, "password_hash": password_hash, "public_id": public_id},
         )
 
 

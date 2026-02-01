@@ -85,6 +85,15 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+  
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+    - "3000:8081"
+    depends_on:
+      - flask_webserver
+
 
 volumes:
   minio_data:

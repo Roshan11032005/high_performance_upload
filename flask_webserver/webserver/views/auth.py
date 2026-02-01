@@ -31,7 +31,7 @@ def index():
 @auth_bp.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        email_id = request.form["username"]
+        email_id = request.form["email_id"]
         password = request.form["password"]
         user = User.get_user(email_id)
 
@@ -63,7 +63,7 @@ def register():
         hashed_password = generate_password_hash(password)
         User.register_user(user_name, email_id, hashed_password, public_id)
 
-        return redirect(url_for("auth.login"))
+        return jsonify({"status": "okay"}), 200
 
     return render_template("register.html")
 
@@ -88,18 +88,3 @@ def logout():
     response = jsonify({"msg": "logged out"})
     unset_jwt_cookies(response)
     return response
-
-
-@auth_bp.post("/s3-metadata")
-@jwt_required
-def s3_metadata():
-    data = request.json
-    email_id = get_jwt_identity()
-    file_path = data["file_path"]
-    size = data["size"]
-    try:
-        Storage.insert_s3_metadata(email_id, file_path, size)
-    except Exception as err:
-        return jsonify({"error": err}), 500
-
-    return jsonify({"status": "okay"})
