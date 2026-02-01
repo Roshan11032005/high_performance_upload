@@ -61,7 +61,7 @@ export default function RegisterScreen({ navigation, apiBaseUrl }) {
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
         },
-        body: `username=${encodeURIComponent(formData.email)}&password=${encodeURIComponent(formData.password)}`,
+        body: `user_name=${encodeURIComponent(formData.fullName)}&email_id=${encodeURIComponent(formData.email)}&password=${encodeURIComponent(formData.password)}`,
       });
 
       if (res.status === 200 || res.status === 302 || res.status === 301) {

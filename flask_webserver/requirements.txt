@@ -2,5 +2,5 @@ flask
 sqlalchemy
 psycopg2-binary
 python-dotenv
-PyJWT
 flask-jwt-extended
+flask-cors

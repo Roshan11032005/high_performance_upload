@@ -34,7 +34,7 @@ export default function SignInScreen({ navigation, onLogin, apiBaseUrl }) {
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
         },
-        body: `username=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`,
+        body: `email_id=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`,
       });
 
       // Success on 200 or redirect (302/301)
