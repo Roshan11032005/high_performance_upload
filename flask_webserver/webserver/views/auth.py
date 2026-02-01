@@ -3,12 +3,8 @@ from flask import (
     request,
     jsonify,
     url_for,
-    make_response,
     render_template,
     redirect,
-    session,
-    g,
-    current_app,
 )
 from flask_jwt_extended import (
     create_access_token,
@@ -80,7 +76,14 @@ def refresh():
     return {"access_token": new_access}
 
 
+@auth_bp.post("/verify-token")
+@jwt_required()
+def verify():
+    return jsonify({"status": "okay"}), 200
+
+
 @auth_bp.post("/logout")
+@jwt_required()
 def logout():
     response = jsonify({"msg": "logged out"})
     unset_jwt_cookies(response)
