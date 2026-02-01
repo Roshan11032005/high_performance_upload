@@ -31,6 +31,8 @@ services:
       POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
+    networks:
+    - app-network
   # Flask Web Server
 
   flask_webserver:
@@ -43,6 +45,8 @@ services:
       - pg_db
     ports:
       - "5001:5001"
+    networks:
+    - app-network
 
   # gnet File Upload Server
   file_server:
@@ -75,25 +79,21 @@ services:
     ports:
       - "5000:5000" # HTTP gateway
       - "9090:9090" # Binary gateway
-    environment:
-      - FLASK_BACKEND=http://flask_webserver:5001
-      - GNET_HTTP_BACKEND=http://file_server:8085
-      - GNET_BINARY_BACKEND=file_server:8081
     depends_on:
       - flask_webserver
       - file_server
     networks:
       - app-network
     restart: unless-stopped
-  
+
   frontend:
     build:
       context: ./frontend
     ports:
-    - "3000:8081"
+      - "3000:8081"
     depends_on:
       - flask_webserver
-
+  
 
 volumes:
   minio_data:

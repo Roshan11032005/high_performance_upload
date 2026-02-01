@@ -12,7 +12,7 @@ import HomeScreen from "./screens/HomeScreen";
 const Stack = createNativeStackNavigator();
 
 // NGROK API base URL
-const API_BASE_URL = "http://localhost:5001";
+const API_BASE_URL = "http://localhost:5000";
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
