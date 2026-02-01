@@ -1,15 +1,19 @@
-// gnet_file_server.go - Advanced file upload server with auth, retry, pause/resume
+// simple_upload_server.go - Fixed Idempotency & Preview Headers
 package main
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +23,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/panjf2000/gnet/v2"
+	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 )
 
 // ============================================
@@ -27,53 +32,33 @@ import (
 // ============================================
 
 const (
-	GNET_PORT = ":8081"
+	HTTP_PORT = ":8085"
 
-	S3_ENDPOINT   = "http://minio:9000"
-	S3_REGION     = "us-east-1"
-	S3_ACCESS_KEY = "admin"
-	S3_SECRET_KEY = "strongpassword"
-	S3_BUCKET     = "uploads"
-
-	// Protocol structure: size_of_auth_token|auth_token|size_of_payload|payload
-	// Header: auth_token_size(4 bytes) | auth_token | payload_size(4 bytes) | command(1 byte) | payload
-
-	// Protocol commands
-	CMD_INIT_UPLOAD   = 0x01 // Initialize upload session
-	CMD_UPLOAD_CHUNK  = 0x02 // Upload a chunk
-	CMD_PAUSE_UPLOAD  = 0x03 // Pause upload
-	CMD_RESUME_UPLOAD = 0x04 // Resume upload
-	CMD_CANCEL_UPLOAD = 0x05 // Cancel upload
-	CMD_GET_STATUS    = 0x06 // Get upload status
-
-	// Response codes
-	RESP_OK           = 0x10 // Success
-	RESP_ERROR        = 0x11 // Error
-	RESP_READY        = 0x12 // Session ready
-	RESP_CHUNK_ACK    = 0x13 // Chunk acknowledged
-	RESP_COMPLETE     = 0x14 // Upload complete
-	RESP_STATUS       = 0x15 // Status response
-	RESP_PAUSED       = 0x16 // Upload paused
-	RESP_RESUMED      = 0x17 // Upload resumed
-	RESP_CANCELLED    = 0x18 // Upload cancelled
-	RESP_AUTH_FAILED  = 0x19 // Authentication failed
-	RESP_DUPLICATE    = 0x1A // Duplicate chunk (already received)
-
-	// Session states
-	STATE_INITIALIZED = "initialized"
-	STATE_UPLOADING   = "uploading"
-	STATE_PAUSED      = "paused"
-	STATE_COMPLETED   = "completed"
-	STATE_CANCELLED   = "cancelled"
-	STATE_FAILED      = "failed"
+	S3_REGION = "us-east-1"
+	S3_BUCKET = "uploads"
 
 	// File constraints
-	MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024 // 10 GB
-	MIN_CHUNK_SIZE = 5 * 1024 * 1024         // 5 MB (S3 minimum for multipart)
+	MAX_FILE_SIZE  = 10 * 1024 * 1024 * 1024 // 10 GB
+	MIN_CHUNK_SIZE = 5 * 1024 * 1024         // 5 MB
 	MAX_CHUNK_SIZE = 100 * 1024 * 1024       // 100 MB
 
 	// Timeouts
 	SESSION_TIMEOUT = 2 * time.Hour
+	TOKEN_LIFETIME  = 5 * time.Minute
+)
+
+// Get S3 configuration from environment variables with defaults
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+var (
+	S3_ENDPOINT   = getEnv("S3_ENDPOINT", "http://localhost:9000")
+	S3_ACCESS_KEY = getEnv("S3_ACCESS_KEY", "admin")
+	S3_SECRET_KEY = getEnv("S3_SECRET_KEY", "strongpassword")
 )
 
 // Supported file types
@@ -88,6 +73,24 @@ var SUPPORTED_EXTENSIONS = map[string]string{
 	".mov":  "video/quicktime",
 	".avi":  "video/x-msvideo",
 	".mkv":  "video/x-matroska",
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".m4a":  "audio/mp4",
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	log.Printf("❌ Error: %s", message)
+	respondJSON(w, status, map[string]string{"error": message})
 }
 
 // ============================================
@@ -150,58 +153,79 @@ func NewS3Client() (*S3Client, error) {
 }
 
 // ============================================
-// Authentication
+// Streaming Token Manager
 // ============================================
 
-type AuthManager struct {
-	tokens map[string]*TokenInfo
-	mu     sync.RWMutex
-}
-
-type TokenInfo struct {
-	UserID    string
-	Username  string
+type StreamingToken struct {
+	Token     string
+	EmailID   string
+	S3Key     string
 	ExpiresAt time.Time
 }
 
-func NewAuthManager() *AuthManager {
-	am := &AuthManager{
-		tokens: make(map[string]*TokenInfo),
-	}
-
-	// Add some demo tokens for testing
-	am.AddToken("test_token_user123", "user_123", "testuser", 24*time.Hour)
-	am.AddToken("test_token_user456", "user_456", "john_doe", 24*time.Hour)
-
-	return am
+type TokenManager struct {
+	tokens map[string]*StreamingToken
+	mu     sync.RWMutex
 }
 
-func (am *AuthManager) ValidateToken(token string) (*TokenInfo, bool) {
-	am.mu.RLock()
-	defer am.mu.RUnlock()
+func NewTokenManager() *TokenManager {
+	tm := &TokenManager{
+		tokens: make(map[string]*StreamingToken),
+	}
+	go tm.cleanupExpiredTokens()
+	return tm
+}
 
-	info, exists := am.tokens[token]
+func (tm *TokenManager) CreateStreamingToken(emailID, s3Key string) string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tokenData := fmt.Sprintf("%s:%s:%d", emailID, s3Key, time.Now().UnixNano())
+	hash := sha256.Sum256([]byte(tokenData))
+	token := hex.EncodeToString(hash[:])
+
+	tm.tokens[token] = &StreamingToken{
+		Token:     token,
+		EmailID:   emailID,
+		S3Key:     s3Key,
+		ExpiresAt: time.Now().Add(TOKEN_LIFETIME),
+	}
+
+	log.Printf("🎫 Created streaming token for user %s (expires in %v)", emailID, TOKEN_LIFETIME)
+	return token
+}
+
+func (tm *TokenManager) ValidateStreamingToken(token string) (*StreamingToken, bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	st, exists := tm.tokens[token]
 	if !exists {
 		return nil, false
 	}
 
-	if time.Now().After(info.ExpiresAt) {
+	if time.Now().After(st.ExpiresAt) {
 		return nil, false
 	}
 
-	return info, true
+	return st, true
 }
 
-func (am *AuthManager) AddToken(token, userID, username string, duration time.Duration) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
+func (tm *TokenManager) cleanupExpiredTokens() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 
-	am.tokens[token] = &TokenInfo{
-		UserID:    userID,
-		Username:  username,
-		ExpiresAt: time.Now().Add(duration),
+	for range ticker.C {
+		tm.mu.Lock()
+		now := time.Now()
+
+		for token, st := range tm.tokens {
+			if now.After(st.ExpiresAt) {
+				delete(tm.tokens, token)
+			}
+		}
+		tm.mu.Unlock()
 	}
-	log.Printf("🔑 Added auth token for user: %s (expires in %v)", username, duration)
 }
 
 // ============================================
@@ -219,10 +243,9 @@ type ChunkInfo struct {
 
 type UploadSession struct {
 	SessionID      string
-	UserID         string
-	Username       string
+	EmailID        string
 	FileName       string
-	S3Key          string // user_id/timestamp/filename
+	S3Key          string
 	FileExtension  string
 	ContentType    string
 	TotalChunks    uint32
@@ -234,7 +257,6 @@ type UploadSession struct {
 	CompletedParts []types.CompletedPart
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
-	PausedAt       *time.Time
 	mu             sync.Mutex
 }
 
@@ -242,18 +264,14 @@ func (us *UploadSession) AddChunk(index uint32, size uint32, hash string, partNu
 	us.mu.Lock()
 	defer us.mu.Unlock()
 
-	// Check if chunk already exists (duplicate)
 	if existing, exists := us.ReceivedChunks[index]; exists {
-		log.Printf("⚠️  Duplicate chunk detected: session=%s, chunk=%d (hash: %s)", us.SessionID, index, hash)
-		// Verify hash matches
 		if existing.Hash == hash {
-			return true // Same chunk, skip (idempotent)
+			return true
 		}
-		log.Printf("❌ Hash mismatch for chunk %d: expected %s, got %s", index, existing.Hash, hash)
+		log.Printf("❌ Hash mismatch for chunk %d", index)
 		return false
 	}
 
-	// Add new chunk
 	us.ReceivedChunks[index] = &ChunkInfo{
 		Index:      index,
 		Size:       size,
@@ -268,9 +286,8 @@ func (us *UploadSession) AddChunk(index uint32, size uint32, hash string, partNu
 		ETag:       aws.String(etag),
 	})
 
-	us.State = STATE_UPLOADING
 	us.UpdatedAt = time.Now()
-	return false // Not duplicate
+	return false
 }
 
 func (us *UploadSession) GetProgress() (received, total uint32) {
@@ -285,43 +302,6 @@ func (us *UploadSession) IsComplete() bool {
 	return len(us.ReceivedChunks) == int(us.TotalChunks)
 }
 
-func (us *UploadSession) GetMissingChunks() []uint32 {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-
-	missing := make([]uint32, 0)
-	for i := uint32(0); i < us.TotalChunks; i++ {
-		if _, exists := us.ReceivedChunks[i]; !exists {
-			missing = append(missing, i)
-		}
-	}
-	return missing
-}
-
-func (us *UploadSession) Pause() {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	now := time.Now()
-	us.State = STATE_PAUSED
-	us.PausedAt = &now
-	us.UpdatedAt = now
-}
-
-func (us *UploadSession) Resume() {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	us.State = STATE_UPLOADING
-	us.PausedAt = nil
-	us.UpdatedAt = time.Now()
-}
-
-func (us *UploadSession) Cancel() {
-	us.mu.Lock()
-	defer us.mu.Unlock()
-	us.State = STATE_CANCELLED
-	us.UpdatedAt = time.Now()
-}
-
 // ============================================
 // Session Manager
 // ============================================
@@ -330,57 +310,38 @@ type SessionManager struct {
 	sessions map[string]*UploadSession
 	mu       sync.RWMutex
 	s3Client *S3Client
-	authMgr  *AuthManager
 }
 
-func NewSessionManager(s3Client *S3Client, authMgr *AuthManager) *SessionManager {
+func NewSessionManager(s3Client *S3Client) *SessionManager {
 	sm := &SessionManager{
 		sessions: make(map[string]*UploadSession),
 		s3Client: s3Client,
-		authMgr:  authMgr,
 	}
-
 	go sm.cleanupLoop()
-
 	return sm
 }
 
-func (sm *SessionManager) CreateSession(userID, username, fileName string, totalChunks, chunkSize uint32) (*UploadSession, error) {
-	// Validate file extension
+func (sm *SessionManager) CreateSession(emailID, fileName string, totalChunks, chunkSize uint32, totalSize uint64) (*UploadSession, error) {
 	ext := strings.ToLower(filepath.Ext(fileName))
 	contentType, supported := SUPPORTED_EXTENSIONS[ext]
 	if !supported {
-		return nil, fmt.Errorf("unsupported file type: %s (supported: mp4, pdf, jpg, png, gif, webp, mov, avi, mkv)", ext)
+		return nil, fmt.Errorf("unsupported file type: %s", ext)
 	}
 
-	// Validate file size
-	totalSize := uint64(totalChunks) * uint64(chunkSize)
 	if totalSize > MAX_FILE_SIZE {
-		return nil, fmt.Errorf("file size exceeds maximum: %d bytes (max: %d)", totalSize, MAX_FILE_SIZE)
+		return nil, fmt.Errorf("file size exceeds maximum: %d bytes", totalSize)
 	}
 
-	// Validate chunk size
-	if chunkSize < MIN_CHUNK_SIZE {
-		return nil, fmt.Errorf("chunk size too small: %d bytes (min: %d)", chunkSize, MIN_CHUNK_SIZE)
-	}
-	if chunkSize > MAX_CHUNK_SIZE {
-		return nil, fmt.Errorf("chunk size too large: %d bytes (max: %d)", chunkSize, MAX_CHUNK_SIZE)
-	}
-
-	// Generate S3 key: user_id/timestamp/filename
 	timestamp := time.Now().Format("20060102_150405")
-	s3Key := fmt.Sprintf("%s/%s/%s", userID, timestamp, fileName)
-
-	// Generate session ID
-	sessionID := fmt.Sprintf("%s_%d", userID, time.Now().UnixNano())
+	s3Key := fmt.Sprintf("%s/%s/%s", emailID, timestamp, fileName)
+	sessionID := fmt.Sprintf("%s_%d", emailID, time.Now().UnixNano())
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	session := &UploadSession{
 		SessionID:      sessionID,
-		UserID:         userID,
-		Username:       username,
+		EmailID:        emailID,
 		FileName:       fileName,
 		S3Key:          s3Key,
 		FileExtension:  ext,
@@ -388,7 +349,7 @@ func (sm *SessionManager) CreateSession(userID, username, fileName string, total
 		TotalChunks:    totalChunks,
 		ChunkSize:      chunkSize,
 		TotalSize:      totalSize,
-		State:          STATE_INITIALIZED,
+		State:          "initialized",
 		ReceivedChunks: make(map[uint32]*ChunkInfo),
 		CompletedParts: make([]types.CompletedPart, 0),
 		CreatedAt:      time.Now(),
@@ -396,8 +357,8 @@ func (sm *SessionManager) CreateSession(userID, username, fileName string, total
 	}
 
 	sm.sessions[sessionID] = session
-	log.Printf("📦 Created session: %s (user: %s, file: %s, size: %.2f MB, chunks: %d, s3: %s)",
-		sessionID, username, fileName, float64(totalSize)/(1024*1024), totalChunks, s3Key)
+	log.Printf("📦 Created session: %s (email: %s, file: %s, size: %.2f MB)",
+		sessionID, emailID, fileName, float64(totalSize)/(1024*1024))
 
 	return session, nil
 }
@@ -422,41 +383,15 @@ func (sm *SessionManager) cleanupLoop() {
 		sm.mu.Lock()
 		now := time.Now()
 		for id, session := range sm.sessions {
-			shouldCleanup := false
-
-			switch session.State {
-			case STATE_COMPLETED, STATE_CANCELLED:
-				// Clean up finished sessions after 1 hour
-				if now.Sub(session.UpdatedAt) > 1*time.Hour {
-					shouldCleanup = true
-				}
-			case STATE_PAUSED:
-				// Clean up paused sessions after SESSION_TIMEOUT
-				if now.Sub(session.UpdatedAt) > SESSION_TIMEOUT {
-					shouldCleanup = true
-				}
-			default:
-				// Clean up stale active sessions
-				if now.Sub(session.UpdatedAt) > SESSION_TIMEOUT {
-					shouldCleanup = true
-				}
-			}
-
-			if shouldCleanup {
-				log.Printf("🧹 Cleaning up session: %s (state: %s, age: %v)", id, session.State, now.Sub(session.CreatedAt))
-
-				// Abort S3 multipart upload if not completed
-				if session.UploadID != "" && session.State != STATE_COMPLETED {
-					_, err := sm.s3Client.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			if now.Sub(session.UpdatedAt) > SESSION_TIMEOUT {
+				log.Printf("🧹 Cleaning up session: %s", id)
+				if session.UploadID != "" && session.State != "completed" {
+					sm.s3Client.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 						Bucket:   aws.String(sm.s3Client.bucket),
 						Key:      aws.String(session.S3Key),
 						UploadId: aws.String(session.UploadID),
 					})
-					if err != nil {
-						log.Printf("⚠️  Failed to abort multipart upload for session %s: %v", id, err)
-					}
 				}
-
 				delete(sm.sessions, id)
 			}
 		}
@@ -465,579 +400,494 @@ func (sm *SessionManager) cleanupLoop() {
 }
 
 // ============================================
-// File Upload Server (gnet)
+// HTTP Handlers
 // ============================================
 
-type FileUploadServer struct {
-	gnet.BuiltinEventEngine
-
+type Server struct {
 	sessionMgr *SessionManager
 	s3Client   *S3Client
-	authMgr    *AuthManager
+	tokenMgr   *TokenManager
 }
 
-type ClientContext struct {
-	buffer      []byte
-	session     *UploadSession
-	userID      string
-	username    string
-	mu          sync.Mutex
-}
+func (s *Server) handleInitUpload(w http.ResponseWriter, r *http.Request) {
+	log.Printf("📥 Received init upload request from %s", r.RemoteAddr)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
 
-func (fus *FileUploadServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	log.Printf("🚀 File upload server started on %s", GNET_PORT)
-	log.Printf("📦 S3: %s/%s", S3_ENDPOINT, S3_BUCKET)
-	log.Printf("📁 Upload path format: user_id/timestamp/filename")
-	log.Printf("📄 Supported formats: mp4, pdf, jpg, png, gif, webp, mov, avi, mkv")
-	log.Printf("📊 Max file size: %.2f GB, Chunk size: %d-%d MB",
-		float64(MAX_FILE_SIZE)/(1024*1024*1024),
-		MIN_CHUNK_SIZE/(1024*1024),
-		MAX_CHUNK_SIZE/(1024*1024))
-	return gnet.None
-}
-
-func (fus *FileUploadServer) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	log.Printf("✅ Client connected: %s", c.RemoteAddr())
-
-	ctx := &ClientContext{
-		buffer: make([]byte, 0, 8192),
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
 	}
-	c.SetContext(ctx)
 
-	return nil, gnet.None
-}
-
-func (fus *FileUploadServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	ctx := c.Context().(*ClientContext)
-
-	// Read all available data
-	data, err := c.Next(-1)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("❌ Error reading data: %v", err)
-		return gnet.Close
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
 	}
 
-	ctx.mu.Lock()
-	ctx.buffer = append(ctx.buffer, data...)
-	ctx.mu.Unlock()
-
-	// Process messages
-	for {
-		ctx.mu.Lock()
-		bufLen := len(ctx.buffer)
-		ctx.mu.Unlock()
-
-		if bufLen < 4 {
-			break // Need at least auth token size
-		}
-
-		ctx.mu.Lock()
-		authTokenSize := binary.BigEndian.Uint32(ctx.buffer[0:4])
-		ctx.mu.Unlock()
-
-		if authTokenSize > 1024 {
-			log.Printf("❌ Invalid auth token size: %d", authTokenSize)
-			c.AsyncWrite(fus.errorResponse("Invalid auth token size"), nil)
-			return gnet.Close
-		}
-
-		headerSize := 4 + int(authTokenSize) + 4
-		if bufLen < headerSize {
-			break // Need complete header
-		}
-
-		ctx.mu.Lock()
-		authToken := string(ctx.buffer[4 : 4+authTokenSize])
-		payloadSize := binary.BigEndian.Uint32(ctx.buffer[4+authTokenSize : headerSize])
-		ctx.mu.Unlock()
-
-		totalSize := headerSize + int(payloadSize)
-		if bufLen < totalSize {
-			break // Need complete message
-		}
-
-		// Authenticate
-		tokenInfo, valid := fus.authMgr.ValidateToken(authToken)
-		if !valid {
-			log.Printf("❌ Authentication failed for token: %s", authToken)
-			c.AsyncWrite(fus.authFailedResponse(), nil)
-
-			ctx.mu.Lock()
-			ctx.buffer = ctx.buffer[totalSize:]
-			ctx.mu.Unlock()
-			continue
-		}
-
-		ctx.userID = tokenInfo.UserID
-		ctx.username = tokenInfo.Username
-
-		// Extract payload
-		ctx.mu.Lock()
-		payload := ctx.buffer[headerSize:totalSize]
-		ctx.mu.Unlock()
-
-		if len(payload) < 1 {
-			log.Printf("❌ Empty payload")
-			c.AsyncWrite(fus.errorResponse("Empty payload"), nil)
-
-			ctx.mu.Lock()
-			ctx.buffer = ctx.buffer[totalSize:]
-			ctx.mu.Unlock()
-			continue
-		}
-
-		// Process command
-		cmd := payload[0]
-		cmdData := payload[1:]
-
-		var response []byte
-		switch cmd {
-		case CMD_INIT_UPLOAD:
-			response = fus.handleInitUpload(ctx, cmdData)
-		case CMD_UPLOAD_CHUNK:
-			response = fus.handleUploadChunk(ctx, cmdData)
-		case CMD_PAUSE_UPLOAD:
-			response = fus.handlePauseUpload(ctx, cmdData)
-		case CMD_RESUME_UPLOAD:
-			response = fus.handleResumeUpload(ctx, cmdData)
-		case CMD_CANCEL_UPLOAD:
-			response = fus.handleCancelUpload(ctx, cmdData)
-		case CMD_GET_STATUS:
-			response = fus.handleGetStatus(ctx, cmdData)
-		default:
-			log.Printf("❌ Unknown command: 0x%02x", cmd)
-			response = fus.errorResponse(fmt.Sprintf("Unknown command: 0x%02x", cmd))
-		}
-
-		c.AsyncWrite(response, nil)
-
-		// Remove processed message
-		ctx.mu.Lock()
-		ctx.buffer = ctx.buffer[totalSize:]
-		ctx.mu.Unlock()
+	var req struct {
+		EmailID     string `json:"email_id"`
+		Filename    string `json:"filename"`
+		FileSize    uint64 `json:"file_size"`
+		TotalChunks uint32 `json:"total_chunks"`
+		ChunkSize   uint32 `json:"chunk_size"`
 	}
 
-	return gnet.None
-}
-
-// CMD_INIT_UPLOAD: filename_size(2) | filename | total_chunks(4) | chunk_size(4)
-func (fus *FileUploadServer) handleInitUpload(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid INIT_UPLOAD: missing filename size")
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
 	}
 
-	fileNameSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+fileNameSize+4+4) {
-		return fus.errorResponse("Invalid INIT_UPLOAD: incomplete data")
+	if req.EmailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
 	}
 
-	fileName := string(data[2 : 2+fileNameSize])
-	totalChunks := binary.BigEndian.Uint32(data[2+fileNameSize : 2+fileNameSize+4])
-	chunkSize := binary.BigEndian.Uint32(data[2+fileNameSize+4 : 2+fileNameSize+8])
+	if req.Filename == "" {
+		respondError(w, http.StatusBadRequest, "filename is required")
+		return
+	}
 
-	log.Printf("📥 INIT_UPLOAD: user=%s, file=%s, chunks=%d, chunk_size=%d MB",
-		ctx.username, fileName, totalChunks, chunkSize/(1024*1024))
-
-	// Create session
-	session, err := fus.sessionMgr.CreateSession(ctx.userID, ctx.username, fileName, totalChunks, chunkSize)
+	session, err := s.sessionMgr.CreateSession(req.EmailID, req.Filename, req.TotalChunks, req.ChunkSize, req.FileSize)
 	if err != nil {
-		log.Printf("❌ Failed to create session: %v", err)
-		return fus.errorResponse(err.Error())
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	ctx.session = session
-
-	// Initialize S3 multipart upload
-	result, err := fus.s3Client.client.CreateMultipartUpload(
-		context.Background(),
-		&s3.CreateMultipartUploadInput{
-			Bucket:      aws.String(fus.s3Client.bucket),
-			Key:         aws.String(session.S3Key),
-			ContentType: aws.String(session.ContentType),
-		},
-	)
+	result, err := s.s3Client.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+		Bucket:      aws.String(s.s3Client.bucket),
+		Key:         aws.String(session.S3Key),
+		ContentType: aws.String(session.ContentType),
+	})
 	if err != nil {
-		log.Printf("❌ Failed to initialize S3 multipart upload: %v", err)
-		return fus.errorResponse(err.Error())
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to initialize S3 upload: %v", err))
+		return
 	}
 
 	session.UploadID = *result.UploadId
-	log.Printf("✅ S3 multipart upload initialized: %s (path: %s)", session.UploadID, session.S3Key)
+	log.Printf("✅ S3 multipart upload initialized: %s", session.UploadID)
 
-	// Response: RESP_READY | session_id_size(2) | session_id | s3_key_size(2) | s3_key
-	sessionIDBytes := []byte(session.SessionID)
-	s3KeyBytes := []byte(session.S3Key)
-
-	response := make([]byte, 1+2+len(sessionIDBytes)+2+len(s3KeyBytes))
-	response[0] = RESP_READY
-	binary.BigEndian.PutUint16(response[1:3], uint16(len(sessionIDBytes)))
-	copy(response[3:3+len(sessionIDBytes)], sessionIDBytes)
-	binary.BigEndian.PutUint16(response[3+len(sessionIDBytes):5+len(sessionIDBytes)], uint16(len(s3KeyBytes)))
-	copy(response[5+len(sessionIDBytes):], s3KeyBytes)
-
-	return response
+	respondJSON(w, http.StatusOK, map[string]string{
+		"session_id": session.SessionID,
+		"s3_key":     session.S3Key,
+		"upload_id":  session.UploadID,
+	})
 }
 
-func (fus *FileUploadServer) handleUploadChunk(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid UPLOAD_CHUNK: missing session ID size")
+func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	emailID := r.FormValue("email_id")
+	sessionID := r.FormValue("session_id")
+	chunkIndexStr := r.FormValue("chunk_index")
+
+	if emailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
 	}
 
-	sessionIDSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+sessionIDSize+4+4) {
-		return fus.errorResponse("Invalid UPLOAD_CHUNK: incomplete header")
-	}
-
-	sessionID := string(data[2 : 2+sessionIDSize])
-	chunkIndex := binary.BigEndian.Uint32(data[2+sessionIDSize : 2+sessionIDSize+4])
-	chunkSize := binary.BigEndian.Uint32(data[2+sessionIDSize+4 : 2+sessionIDSize+8])
-
-	// FIX: Cast to int to avoid type mismatch
-	headerSize := int(2 + sessionIDSize + 8)
-	totalSize := headerSize + int(chunkSize)
-
-	if len(data) < totalSize {
-		return fus.errorResponse("Invalid UPLOAD_CHUNK: incomplete chunk data")
-	}
-
-	chunkData := data[headerSize:totalSize]
-
-	// Verify session
-	session := fus.sessionMgr.GetSession(sessionID)
+	chunkIndex, _ := strconv.ParseUint(chunkIndexStr, 10, 32)
+	session := s.sessionMgr.GetSession(sessionID)
 	if session == nil {
-		return fus.errorResponse("Invalid session ID")
+		respondError(w, http.StatusBadRequest, "Invalid session ID")
+		return
 	}
 
-	if session.UserID != ctx.userID {
-		return fus.errorResponse("Session does not belong to user")
+	if session.EmailID != emailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
+		return
 	}
 
-	if session.State == STATE_PAUSED {
-		return fus.errorResponse("Upload is paused. Resume first.")
+	file, _, err := r.FormFile("chunk")
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read chunk")
+		return
+	}
+	defer file.Close()
+
+	chunkData, err := io.ReadAll(file)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to read chunk data")
+		return
 	}
 
-	if session.State == STATE_CANCELLED {
-		return fus.errorResponse("Upload was cancelled")
-	}
-
-	// Calculate chunk hash
 	hash := sha256.Sum256(chunkData)
 	hashStr := hex.EncodeToString(hash[:])
-
-	// Upload chunk to S3
 	partNumber := int32(chunkIndex) + 1
 
-	result, err := fus.s3Client.client.UploadPart(
-		context.Background(),
-		&s3.UploadPartInput{
-			Bucket:     aws.String(fus.s3Client.bucket),
-			Key:        aws.String(session.S3Key),
-			UploadId:   aws.String(session.UploadID),
-			PartNumber: aws.Int32(partNumber),
-			Body:       bytes.NewReader(chunkData),
-		},
-	)
+	result, err := s.s3Client.client.UploadPart(context.Background(), &s3.UploadPartInput{
+		Bucket:     aws.String(s.s3Client.bucket),
+		Key:        aws.String(session.S3Key),
+		UploadId:   aws.String(session.UploadID),
+		PartNumber: aws.Int32(partNumber),
+		Body:       bytes.NewReader(chunkData),
+	})
 	if err != nil {
-		log.Printf("❌ Failed to upload part %d: %v", partNumber, err)
-		return fus.errorResponse(fmt.Sprintf("S3 upload failed: %v", err))
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("S3 upload failed: %v", err))
+		return
 	}
 
-	// Add chunk to session
-	isDuplicate := session.AddChunk(chunkIndex, chunkSize, hashStr, partNumber, *result.ETag)
-
+	isDuplicate := session.AddChunk(uint32(chunkIndex), uint32(len(chunkData)), hashStr, partNumber, *result.ETag)
 	received, total := session.GetProgress()
-	log.Printf("📦 Chunk %d/%d uploaded (%.1f%%, hash: %s, etag: %s)",
-		received, total, float64(received)/float64(total)*100, hashStr[:8], *result.ETag)
 
-	// Check if upload is complete
+	log.Printf("📦 Chunk %d/%d uploaded (%.1f%%)", received, total, float64(received)/float64(total)*100)
+
+	// Auto-finalize if complete (handling this cleanly in finalizeUpload for idempotency)
 	if session.IsComplete() {
-		return fus.finalizeUpload(session)
+		s.finalizeUpload(w, session)
+		return
 	}
 
-	// Response
-	if isDuplicate {
-		// RESP_DUPLICATE | chunk_index(4) | progress(4)
-		response := make([]byte, 9)
-		response[0] = RESP_DUPLICATE
-		binary.BigEndian.PutUint32(response[1:5], chunkIndex)
-		binary.BigEndian.PutUint32(response[5:9], received)
-		return response
-	}
-
-	// RESP_CHUNK_ACK | chunk_index(4) | progress(4) | total(4)
-	response := make([]byte, 13)
-	response[0] = RESP_CHUNK_ACK
-	binary.BigEndian.PutUint32(response[1:5], chunkIndex)
-	binary.BigEndian.PutUint32(response[5:9], received)
-	binary.BigEndian.PutUint32(response[9:13], total)
-
-	return response
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     true,
+		"duplicate":   isDuplicate,
+		"chunk_index": chunkIndex,
+		"received":    received,
+		"total":       total,
+		"progress":    float64(received) / float64(total) * 100,
+	})
 }
 
-// CMD_PAUSE_UPLOAD: session_id_size(2) | session_id
-func (fus *FileUploadServer) handlePauseUpload(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid PAUSE_UPLOAD: missing session ID size")
+// FIX: Made this function idempotent to prevent "NoSuchUpload" on double calls
+func (s *Server) finalizeUpload(w http.ResponseWriter, session *UploadSession) {
+	session.mu.Lock()
+	if session.State == "completed" {
+		session.mu.Unlock()
+		log.Printf("⚠️ Upload %s already completed, returning cached success", session.SessionID)
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"completed": true,
+			"s3_key":    session.S3Key,
+			"file_size": session.TotalSize,
+		})
+		return
 	}
 
-	sessionIDSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+sessionIDSize) {
-		return fus.errorResponse("Invalid PAUSE_UPLOAD: incomplete data")
+	if session.State == "finalizing" {
+		session.mu.Unlock()
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success":   true,
+			"completed": true,
+			"status":    "finalizing",
+		})
+		return
 	}
 
-	sessionID := string(data[2 : 2+sessionIDSize])
+	session.State = "finalizing"
+	session.mu.Unlock()
 
-	session := fus.sessionMgr.GetSession(sessionID)
-	if session == nil {
-		return fus.errorResponse("Invalid session ID")
+	log.Printf("🔄 Finalizing upload: %s", session.SessionID)
+
+	_, err := s.s3Client.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.s3Client.bucket),
+		Key:      aws.String(session.S3Key),
+		UploadId: aws.String(session.UploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: session.CompletedParts,
+		},
+	})
+
+	if err != nil {
+		// If it failed, it might have been completed by another thread or process
+		// But in most cases, this is a genuine error or the ID is invalid.
+		// For robustness, if it's "NoSuchUpload", we could check if object exists,
+		// but typically we should just error or reset.
+
+		// Reset state to allow retry if it was a network glitch
+		session.mu.Lock()
+		session.State = "initialized"
+		session.mu.Unlock()
+
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to complete upload: %v", err))
+		return
 	}
 
-	if session.UserID != ctx.userID {
-		return fus.errorResponse("Session does not belong to user")
-	}
+	session.mu.Lock()
+	session.State = "completed"
+	session.UpdatedAt = time.Now()
+	session.mu.Unlock()
 
-	session.Pause()
-	received, total := session.GetProgress()
+	log.Printf("✅ Upload completed: %s", session.FileName)
 
-	log.Printf("⏸️  Upload paused: session=%s, progress=%d/%d", sessionID, received, total)
-
-	// Response: RESP_PAUSED | received(4) | total(4)
-	response := make([]byte, 9)
-	response[0] = RESP_PAUSED
-	binary.BigEndian.PutUint32(response[1:5], received)
-	binary.BigEndian.PutUint32(response[5:9], total)
-
-	return response
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"s3_key":    session.S3Key,
+		"file_size": session.TotalSize,
+	})
 }
 
-// CMD_RESUME_UPLOAD: session_id_size(2) | session_id
-func (fus *FileUploadServer) handleResumeUpload(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid RESUME_UPLOAD: missing session ID size")
+func (s *Server) handleCompleteUpload(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
 	}
 
-	sessionIDSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+sessionIDSize) {
-		return fus.errorResponse("Invalid RESUME_UPLOAD: incomplete data")
+	var req struct {
+		EmailID   string `json:"email_id"`
+		SessionID string `json:"session_id"`
 	}
 
-	sessionID := string(data[2 : 2+sessionIDSize])
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
 
-	session := fus.sessionMgr.GetSession(sessionID)
+	session := s.sessionMgr.GetSession(req.SessionID)
 	if session == nil {
-		return fus.errorResponse("Invalid session ID")
+		respondError(w, http.StatusBadRequest, "Invalid session ID")
+		return
 	}
 
-	if session.UserID != ctx.userID {
-		return fus.errorResponse("Session does not belong to user")
+	if session.EmailID != req.EmailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
+		return
 	}
 
-	if session.State != STATE_PAUSED {
-		return fus.errorResponse("Upload is not paused")
+	if !session.IsComplete() {
+		respondError(w, http.StatusBadRequest, "Upload not complete")
+		return
 	}
 
-	session.Resume()
-	received, total := session.GetProgress()
-	missing := session.GetMissingChunks()
-
-	log.Printf("▶️  Upload resumed: session=%s, progress=%d/%d, missing=%d", sessionID, received, total, len(missing))
-
-	// Response: RESP_RESUMED | received(4) | total(4) | missing_count(4) | missing_chunks...
-	response := make([]byte, 13+len(missing)*4)
-	response[0] = RESP_RESUMED
-	binary.BigEndian.PutUint32(response[1:5], received)
-	binary.BigEndian.PutUint32(response[5:9], total)
-	binary.BigEndian.PutUint32(response[9:13], uint32(len(missing)))
-
-	for i, chunkIdx := range missing {
-		binary.BigEndian.PutUint32(response[13+i*4:13+(i+1)*4], chunkIdx)
-	}
-
-	return response
+	s.finalizeUpload(w, session)
 }
 
-// CMD_CANCEL_UPLOAD: session_id_size(2) | session_id
-func (fus *FileUploadServer) handleCancelUpload(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid CANCEL_UPLOAD: missing session ID size")
+func (s *Server) handleCancelUpload(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🚫 Received cancel upload request")
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
 	}
 
-	sessionIDSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+sessionIDSize) {
-		return fus.errorResponse("Invalid CANCEL_UPLOAD: incomplete data")
+	var req struct {
+		EmailID   string `json:"email_id"`
+		SessionID string `json:"session_id"`
 	}
 
-	sessionID := string(data[2 : 2+sessionIDSize])
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
 
-	session := fus.sessionMgr.GetSession(sessionID)
+	session := s.sessionMgr.GetSession(req.SessionID)
 	if session == nil {
-		return fus.errorResponse("Invalid session ID")
+		respondJSON(w, http.StatusOK, map[string]string{"status": "session_not_found_or_already_deleted"})
+		return
 	}
 
-	if session.UserID != ctx.userID {
-		return fus.errorResponse("Session does not belong to user")
+	if session.EmailID != req.EmailID {
+		respondError(w, http.StatusForbidden, "Unauthorized: email_id mismatch")
+		return
 	}
 
-	session.Cancel()
-
-	log.Printf("🛑 Upload cancelled: session=%s", sessionID)
-
-	// Abort S3 multipart upload
 	if session.UploadID != "" {
-		_, err := fus.s3Client.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(fus.s3Client.bucket),
+		_, err := s.s3Client.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.s3Client.bucket),
 			Key:      aws.String(session.S3Key),
 			UploadId: aws.String(session.UploadID),
 		})
 		if err != nil {
-			log.Printf("⚠️  Failed to abort S3 upload: %v", err)
+			log.Printf("⚠️ Failed to abort S3 upload: %v", err)
+		} else {
+			log.Printf("✅ S3 upload aborted for session: %s", req.SessionID)
 		}
 	}
 
-	// Clean up session
-	fus.sessionMgr.DeleteSession(sessionID)
-
-	// Response: RESP_CANCELLED
-	return []byte{RESP_CANCELLED}
+	s.sessionMgr.DeleteSession(req.SessionID)
+	respondJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
-// CMD_GET_STATUS: session_id_size(2) | session_id
-func (fus *FileUploadServer) handleGetStatus(ctx *ClientContext, data []byte) []byte {
-	if len(data) < 2 {
-		return fus.errorResponse("Invalid GET_STATUS: missing session ID size")
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	emailID := r.URL.Query().Get("email_id")
+	if emailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
 	}
 
-	sessionIDSize := binary.BigEndian.Uint16(data[0:2])
-	if len(data) < int(2+sessionIDSize) {
-		return fus.errorResponse("Invalid GET_STATUS: incomplete data")
-	}
-
-	sessionID := string(data[2 : 2+sessionIDSize])
-
-	session := fus.sessionMgr.GetSession(sessionID)
-	if session == nil {
-		return fus.errorResponse("Invalid session ID")
-	}
-
-	if session.UserID != ctx.userID {
-		return fus.errorResponse("Session does not belong to user")
-	}
-
-	received, total := session.GetProgress()
-	stateBytes := []byte(session.State)
-
-	// Response: RESP_STATUS | state_size(1) | state | received(4) | total(4)
-	response := make([]byte, 1+1+len(stateBytes)+4+4)
-	response[0] = RESP_STATUS
-	response[1] = byte(len(stateBytes))
-	copy(response[2:2+len(stateBytes)], stateBytes)
-	binary.BigEndian.PutUint32(response[2+len(stateBytes):6+len(stateBytes)], received)
-	binary.BigEndian.PutUint32(response[6+len(stateBytes):10+len(stateBytes)], total)
-
-	return response
-}
-
-func (fus *FileUploadServer) finalizeUpload(session *UploadSession) []byte {
-	log.Printf("🔄 Finalizing upload: session=%s, file=%s, parts=%d", session.SessionID, session.FileName, len(session.CompletedParts))
-
-	// Complete S3 multipart upload
-	_, err := fus.s3Client.client.CompleteMultipartUpload(
-		context.Background(),
-		&s3.CompleteMultipartUploadInput{
-			Bucket:   aws.String(fus.s3Client.bucket),
-			Key:      aws.String(session.S3Key),
-			UploadId: aws.String(session.UploadID),
-			MultipartUpload: &types.CompletedMultipartUpload{
-				Parts: session.CompletedParts,
-			},
-		},
-	)
+	prefix := emailID + "/"
+	result, err := s.s3Client.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.s3Client.bucket),
+		Prefix: aws.String(prefix),
+	})
 	if err != nil {
-		log.Printf("❌ Failed to complete S3 upload: %v", err)
-		session.State = STATE_FAILED
-		return fus.errorResponse(fmt.Sprintf("Failed to complete upload: %v", err))
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list files: %v", err))
+		return
 	}
 
-	session.mu.Lock()
-	session.State = STATE_COMPLETED
-	session.UpdatedAt = time.Now()
-	session.mu.Unlock()
-
-	log.Printf("✅ Upload completed: file=%s, size=%.2f MB, s3_key=%s",
-		session.FileName, float64(session.TotalSize)/(1024*1024), session.S3Key)
-
-	// Response: RESP_COMPLETE | s3_key_size(2) | s3_key | file_size(8)
-	s3KeyBytes := []byte(session.S3Key)
-	response := make([]byte, 1+2+len(s3KeyBytes)+8)
-	response[0] = RESP_COMPLETE
-	binary.BigEndian.PutUint16(response[1:3], uint16(len(s3KeyBytes)))
-	copy(response[3:3+len(s3KeyBytes)], s3KeyBytes)
-	binary.BigEndian.PutUint64(response[3+len(s3KeyBytes):], session.TotalSize)
-
-	return response
-}
-
-func (fus *FileUploadServer) errorResponse(message string) []byte {
-	msgBytes := []byte(message)
-	if len(msgBytes) > 255 {
-		msgBytes = msgBytes[:255]
+	files := make([]map[string]interface{}, 0)
+	for _, obj := range result.Contents {
+		files = append(files, map[string]interface{}{
+			"key":           *obj.Key,
+			"size":          *obj.Size,
+			"last_modified": obj.LastModified,
+		})
 	}
 
-	response := make([]byte, 2+len(msgBytes))
-	response[0] = RESP_ERROR
-	response[1] = byte(len(msgBytes))
-	copy(response[2:], msgBytes)
-
-	return response
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"files": files,
+		"count": len(files),
+	})
 }
 
-func (fus *FileUploadServer) authFailedResponse() []byte {
-	return []byte{RESP_AUTH_FAILED}
-}
-
-func (fus *FileUploadServer) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+func (s *Server) handleRequestStreamingToken(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("❌ Client disconnected with error: %v", err)
-	} else {
-		log.Printf("👋 Client disconnected: %s", c.RemoteAddr())
+		respondError(w, http.StatusBadRequest, "Failed to read request body")
+		return
 	}
-	return gnet.None
+
+	var req struct {
+		EmailID string `json:"email_id"`
+		S3Key   string `json:"s3_key"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+		return
+	}
+
+	if req.EmailID == "" {
+		respondError(w, http.StatusBadRequest, "email_id is required")
+		return
+	}
+
+	if !strings.HasPrefix(req.S3Key, req.EmailID+"/") {
+		respondError(w, http.StatusForbidden, "Unauthorized")
+		return
+	}
+
+	token := s.tokenMgr.CreateStreamingToken(req.EmailID, req.S3Key)
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"token":      token,
+		"expires_in": int(TOKEN_LIFETIME.Seconds()),
+		"s3_key":     req.S3Key,
+	})
 }
 
-// ============================================
-// Main
-// ============================================
+func (s *Server) handleStreamFile(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		respondError(w, http.StatusUnauthorized, "Missing streaming token")
+		return
+	}
+
+	streamingToken, valid := s.tokenMgr.ValidateStreamingToken(token)
+	if !valid {
+		respondError(w, http.StatusForbidden, "Invalid or expired streaming token")
+		return
+	}
+
+	s3Key := streamingToken.S3Key
+
+	headResult, err := s.s3Client.client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(s.s3Client.bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		respondError(w, http.StatusNotFound, "File not found")
+		return
+	}
+
+	fileSize := *headResult.ContentLength
+	contentType := ""
+	if headResult.ContentType != nil {
+		contentType = *headResult.ContentType
+	}
+	if contentType == "" || contentType == "application/octet-stream" {
+		ext := strings.ToLower(filepath.Ext(s3Key))
+		if ct, ok := SUPPORTED_EXTENSIONS[ext]; ok {
+			contentType = ct
+		}
+	}
+
+	// FIX: Force inline content disposition for preview support
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filepath.Base(s3Key)))
+
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		var start, end int64
+		fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+		if end == 0 || end >= fileSize {
+			end = fileSize - 1
+		}
+
+		result, err := s.s3Client.client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(s.s3Client.bucket),
+			Key:    aws.String(s3Key),
+			Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+		})
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "Failed to stream file")
+			return
+		}
+		defer result.Body.Close()
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+
+		io.Copy(w, result.Body)
+		return
+	}
+
+	result, err := s.s3Client.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.s3Client.bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to stream file")
+		return
+	}
+	defer result.Body.Close()
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+
+	io.Copy(w, result.Body)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]string{"status": "healthy", "time": time.Now().Format(time.RFC3339)})
+}
 
 func main() {
-	log.Printf("🚀 Starting advanced file upload server")
-	log.Printf("📁 S3 path format: user_id/timestamp/filename")
-	log.Printf("📄 Supported: MP4, PDF, Images (up to 10GB)")
-
-	// Initialize S3 client
+	log.Printf("🚀 Starting Fixed Upload Server (Idempotent)")
 	s3Client, err := NewS3Client()
 	if err != nil {
 		log.Fatalf("❌ Failed to initialize S3: %v", err)
 	}
-	log.Printf("✅ S3 client initialized")
 
-	// Initialize auth manager
-	authMgr := NewAuthManager()
+	tokenMgr := NewTokenManager()
+	sessionMgr := NewSessionManager(s3Client)
+	server := &Server{sessionMgr: sessionMgr, s3Client: s3Client, tokenMgr: tokenMgr}
 
-	// Create session manager
-	sessionMgr := NewSessionManager(s3Client, authMgr)
+	router := mux.NewRouter()
+	router.HandleFunc("/health", server.handleHealth).Methods("GET", "OPTIONS")
+	router.HandleFunc("/upload/init", server.handleInitUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/chunk", server.handleUploadChunk).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/complete", server.handleCompleteUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/upload/cancel", server.handleCancelUpload).Methods("POST", "OPTIONS")
+	router.HandleFunc("/files", server.handleListFiles).Methods("GET", "OPTIONS")
+	router.HandleFunc("/files/streaming-token", server.handleRequestStreamingToken).Methods("POST", "OPTIONS")
+	router.HandleFunc("/stream", server.handleStreamFile).Methods("GET", "OPTIONS")
 
-	// Start gnet server
-	fileServer := &FileUploadServer{
-		sessionMgr: sessionMgr,
-		s3Client:   s3Client,
-		authMgr:    authMgr,
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders: []string{"*"},
+		ExposedHeaders: []string{"Content-Length", "Content-Type", "Content-Range", "Accept-Ranges", "Content-Disposition"},
+		AllowCredentials: false,
+		MaxAge: 86400,
+	})
+
+	log.Printf("✅ Server listening on %s", HTTP_PORT)
+	if err := http.ListenAndServe(HTTP_PORT, c.Handler(router)); err != nil {
+		log.Fatalf("❌ Server failed: %v", err)
 	}
-
-	// FIX: Remove WithEdgeTriggeredIO as it might not be available in your gnet version
-	log.Fatal(gnet.Run(fileServer, fmt.Sprintf("tcp://%s", GNET_PORT),
-		gnet.WithMulticore(true),
-		gnet.WithReusePort(true),
-		gnet.WithReadBufferCap(64*1024*1024), // 64MB read buffer for large chunks
-		gnet.WithWriteBufferCap(4*1024*1024), // 4MB write buffer
-	))
 }
